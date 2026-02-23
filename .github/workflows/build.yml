@@ -23,17 +23,15 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Build project
-      working-directory: src
       run: |
-        msbuild ShaderToggler.sln `
+        msbuild src/ShaderToggler.sln `
           /p:Configuration=${{ matrix.configuration }} `
           /p:Platform=${{ matrix.platform }} `
           /m
 
     - name: Upload addon artifact
       uses: actions/upload-artifact@v4
-      working-directory: src
       with:
         name: ShaderToggler-${{ matrix.configuration }}-${{ matrix.platform }}
         path: |
-          **/x64/${{ matrix.configuration }}/x64/Debug/ShaderToggler.addon64
+          **src/x64/${{ matrix.configuration }}/ShaderToggler.addon64
