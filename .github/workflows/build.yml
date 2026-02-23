@@ -1,0 +1,37 @@
+name: Build ShaderToggler
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    strategy:
+      matrix:
+        configuration: [Debug]
+        platform: [x64]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build project
+      run: |
+        msbuild ShaderToggler.sln `
+          /p:Configuration=${{ matrix.configuration }} `
+          /p:Platform=${{ matrix.platform }} `
+          /m
+
+    - name: Upload addon artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ShaderToggler-${{ matrix.configuration }}-${{ matrix.platform }}
+        path: |
+          **/x64/${{ matrix.configuration }}/ShaderToggler.addon64
