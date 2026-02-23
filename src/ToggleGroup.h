@@ -45,7 +45,7 @@ namespace ShaderToggler
 		ToggleGroup(std::string name, int Id);
 
 		static int getNewGroupId();
-
+		ToggleGroup createCopy() const;
 		void setToggleKey(uint8_t newKeyValue, bool shiftRequired, bool altRequired, bool ctrlRequired);
 		void setToggleKey(KeyData newData);
 		void setName(std::string newName);

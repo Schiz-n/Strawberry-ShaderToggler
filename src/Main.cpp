@@ -121,6 +121,14 @@ void loadShaderTogglerIniFile()
 		// not there
 		return;
 	}
+	const float savedOpacity = iniFile.GetFloat("OverlayOpacity", "Settings");
+	if (savedOpacity != FLT_MIN) g_overlayOpacity = savedOpacity;
+	const int savedFrameCount = iniFile.GetInt("FramecountCollectionPhase", "Settings");
+	if (savedFrameCount != INT_MIN) g_startValueFramecountCollectionPhase = savedFrameCount;
+	const int savedRepeatDelay = iniFile.GetInt("KeyRepeatDelayMs", "Settings");
+	if (savedRepeatDelay != INT_MIN) g_keyRepeatDelayMs = savedRepeatDelay;
+	const int savedRepeatInterval = iniFile.GetInt("KeyRepeatIntervalMs", "Settings");
+	if (savedRepeatInterval != INT_MIN) g_keyRepeatIntervalMs = savedRepeatInterval;
 	int groupCounter = 0;
 	const int numberOfGroups = iniFile.GetInt("AmountGroups", "General");
 	if(numberOfGroups==INT_MIN)
@@ -152,6 +160,10 @@ void saveShaderTogglerIniFile()
 	// format: first section with # of groups, then per group a section with pixel and vertex shaders, as well as their name and key value.
 	// groups are stored with "Group" + group counter, starting with 0.
 	CDataFile iniFile;
+	iniFile.SetFloat("OverlayOpacity", g_overlayOpacity, "", "Settings");
+	iniFile.SetInt("FramecountCollectionPhase", g_startValueFramecountCollectionPhase, "", "Settings");
+	iniFile.SetInt("KeyRepeatDelayMs", g_keyRepeatDelayMs, "", "Settings");
+	iniFile.SetInt("KeyRepeatIntervalMs", g_keyRepeatIntervalMs, "", "Settings");
 	iniFile.SetInt("AmountGroups", g_toggleGroups.size(), "",  "General");
 
 	int groupCounter = 0;
@@ -663,6 +675,7 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::Separator();
 
 		std::vector<ToggleGroup> toRemove;
+		std::vector<ToggleGroup> toAdd;
 		for(auto& group : g_toggleGroups)
 		{
 			ImGui::PushID(group.getId());
@@ -678,7 +691,20 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 			{
 				group.setEditing(true);
 			}
-
+			ImGui::SameLine();
+			if (g_toggleGroupIdShaderEditing >= 0)
+			{
+				ImGui::BeginDisabled(true);
+				ImGui::Button(" Copy ");
+				ImGui::EndDisabled();
+			}
+			else
+			{
+				if (ImGui::Button(" Copy "))
+				{
+					toAdd.push_back(group.createCopy());
+				}
+			}
 			ImGui::SameLine();
 			if(g_toggleGroupIdShaderEditing >= 0)
 			{
@@ -792,7 +818,10 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		{
 			std::erase(g_toggleGroups, group);
 		}
-
+		for (auto& copy : toAdd)
+		{
+			g_toggleGroups.push_back(std::move(copy));
+		}
 		ImGui::Separator();
 		if(g_toggleGroups.size() > 0)
 		{

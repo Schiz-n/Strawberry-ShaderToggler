@@ -50,6 +50,18 @@ namespace ShaderToggler
 		return s_groupId;
 	}
 
+	ToggleGroup ToggleGroup::createCopy() const
+	{
+		ToggleGroup copy(_name + " (Copy)", getNewGroupId());
+		copy._keyData = _keyData;
+		copy._isActiveAtStartup = _isActiveAtStartup;
+		copy._isActive = false;   // start inactive so it doesn't immediately affect rendering
+		copy._isEditing = false;
+		copy._pixelShaderHashes = _pixelShaderHashes;
+		copy._vertexShaderHashes = _vertexShaderHashes;
+		copy._computeShaderHashes = _computeShaderHashes;
+		return copy;
+	}
 
 	void ToggleGroup::setToggleKey(uint8_t newKeyValue, bool shiftRequired, bool altRequired, bool ctrlRequired)
 	{
