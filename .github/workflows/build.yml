@@ -1,19 +1,12 @@
-name: Build ShaderToggler
+name: Build and Auto-Release ShaderToggler
 
 on:
   push:
-    branches: [ main ]
-  pull_request:
     branches: [ main ]
 
 jobs:
   build:
     runs-on: windows-latest
-
-    strategy:
-      matrix:
-        configuration: [Debug]
-        platform: [x64]
 
     steps:
     - name: Checkout repository
@@ -22,16 +15,25 @@ jobs:
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v2
 
+    - name: Generate timestamp
+      id: timestamp
+      shell: pwsh
+      run: |
+        $date = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        echo "value=$date" >> $env:GITHUB_OUTPUT
+
     - name: Build project
       run: |
         msbuild src/ShaderToggler.sln `
-          /p:Configuration=${{ matrix.configuration }} `
-          /p:Platform=${{ matrix.platform }} `
+          /p:Configuration=Release `
+          /p:Platform=x64 `
           /m
 
-    - name: Upload addon artifact
-      uses: actions/upload-artifact@v4
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
       with:
-        name: ShaderToggler-${{ matrix.configuration }}-${{ matrix.platform }}
-        path: |
-          **src/x64/${{ matrix.configuration }}/ShaderToggler.addon64
+        tag_name: ${{ steps.timestamp.outputs.value }}
+        name: Build ${{ steps.timestamp.outputs.value }}
+        files: src/x64/Release/ShaderToggler.addon64
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
