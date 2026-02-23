@@ -76,8 +76,8 @@ struct KeyRepeatState {
 	std::chrono::steady_clock::time_point lastRepeat;
 };
 
-static constexpr auto KEY_REPEAT_DELAY = std::chrono::milliseconds(500); // initial hold-before-repeat
-static constexpr auto KEY_REPEAT_INTERVAL = std::chrono::milliseconds(125);  // speed once repeating
+static int g_keyRepeatDelayMs = 500;  // milliseconds before repeat starts
+static int g_keyRepeatIntervalMs = 125;  // milliseconds between repeats
 
 static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
 
@@ -457,8 +457,8 @@ static void handleHuntKey(effect_runtime* runtime, int vkKey, int keyIndex, F ac
 		return;
 	}
 	// Already held — check if past initial delay and repeat interval
-	if ((now - state.holdStart) >= KEY_REPEAT_DELAY &&
-		(now - state.lastRepeat) >= KEY_REPEAT_INTERVAL)
+	if ((now - state.holdStart) >= std::chrono::milliseconds(g_keyRepeatDelayMs) &&
+		(now - state.lastRepeat) >= std::chrono::milliseconds(g_keyRepeatIntervalMs))
 	{
 		state.lastRepeat = now;
 		action();
@@ -641,6 +641,15 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::SliderInt("# of frames to collect", &g_startValueFramecountCollectionPhase, 10, 1000);
 		ImGui::SameLine();
 		showHelpMarker("This is the number of frames the addon will collect active shaders. Set this to a high number if the shader you want to mark is only used occasionally. Only shaders that are used in the frames collected can be marked.");
+		ImGui::AlignTextToFramePadding();
+		ImGui::SliderInt("Search hold delay (ms)", &g_keyRepeatDelayMs, 100, 1000);
+		ImGui::SameLine();
+		showHelpMarker("How long you must hold a numpad key before it starts repeating. Lower = faster response.");
+
+		ImGui::AlignTextToFramePadding();
+		ImGui::SliderInt("Search repeat speed (ms)", &g_keyRepeatIntervalMs, 20, 500);
+		ImGui::SameLine();
+		showHelpMarker("How quickly the shader steps repeat while holding. Lower = faster scrolling.");
 		ImGui::PopItemWidth();
 	}
 	ImGui::Separator();
