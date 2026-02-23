@@ -1,6 +1,6 @@
 # Strawberry ShaderToggler
 
-Custom reimplementation of Special K adapted for Where Winds Meet initially but should work elsewhere.
+Custom reimplementation of ShaderToggler adapted for Where Winds Meet initially but should work elsewhere.
 
 All uses of this tool are purely cosmetic. It has no use in combat or lifeskilling.
 
