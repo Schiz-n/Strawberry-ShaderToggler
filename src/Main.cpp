@@ -1,4 +1,4 @@
-///////////////////////////////////////////////////////////////////////
+﻿///////////////////////////////////////////////////////////////////////
 //
 // Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
 // to define groups of shaders to toggle them on/off with one key press
@@ -41,6 +41,7 @@
 #include "ToggleGroup.h"
 #include <vector>
 #include <filesystem>
+#include <chrono>
 
 using namespace reshade::api;
 using namespace ShaderToggler;
@@ -68,6 +69,17 @@ static atomic_int g_toggleGroupIdShaderEditing = -1;
 static float g_overlayOpacity = 1.0f;
 static int g_startValueFramecountCollectionPhase = FRAMECOUNT_COLLECTION_PHASE_DEFAULT;
 static std::string g_iniFileName = "";
+// Key repeat state for shader hunting
+struct KeyRepeatState {
+	bool isHeld = false;
+	std::chrono::steady_clock::time_point holdStart;
+	std::chrono::steady_clock::time_point lastRepeat;
+};
+
+static constexpr auto KEY_REPEAT_DELAY = std::chrono::milliseconds(500); // initial hold-before-repeat
+static constexpr auto KEY_REPEAT_INTERVAL = std::chrono::milliseconds(125);  // speed once repeating
+
+static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
 
 /// <summary>
 /// Calculates a crc32 hash from the passed in shader bytecode. The hash is used to identity the shader in future runs.
@@ -216,7 +228,13 @@ static void displayShaderManagerInfo(ShaderManager& toDisplay, const char* shade
 	if(toDisplay.isInHuntingMode())
 	{
 		ImGui::Text("# of %s shaders active: %d. # of %s shaders in group: %d", shaderType, toDisplay.getAmountShaderHashesCollected(), shaderType, toDisplay.getMarkedShaderCount());
-		ImGui::Text("Current selected %s shader: %d / %d.", shaderType, toDisplay.getActiveHuntedShaderIndex(), toDisplay.getAmountShaderHashesCollected());
+		// To this:
+		ImGui::Text("Current selected %s shader: %d / %d  [Hash: 0x%08X]",
+			shaderType,
+			toDisplay.getActiveHuntedShaderIndex(),
+			toDisplay.getAmountShaderHashesCollected(),
+			toDisplay.getActiveHuntedShaderHash()   // you already have this getter
+		);
 		if(toDisplay.isHuntedShaderMarked())
 		{
 			displayIsPartOfToggleGroup();
@@ -416,6 +434,36 @@ static bool onDrawOrDispatchIndirect(command_list* commandList, indirect_command
 	return false;
 }
 
+// Helper — call once per frame per key
+// keyIndex: 0-8 maps to VK_NUMPAD1 through VK_NUMPAD9
+// action: the lambda to run when triggered
+template<typename F>
+static void handleHuntKey(effect_runtime* runtime, int vkKey, int keyIndex, F action)
+{
+	auto& state = g_keyRepeat[keyIndex];
+	const bool isDown = runtime->is_key_down(vkKey);
+	const auto now = std::chrono::steady_clock::now();
+
+	if (!isDown) {
+		state.isHeld = false;
+		return;
+	}
+	if (!state.isHeld) {
+		// Fresh press — fire immediately
+		state.isHeld = true;
+		state.holdStart = now;
+		state.lastRepeat = now;
+		action();
+		return;
+	}
+	// Already held — check if past initial delay and repeat interval
+	if ((now - state.holdStart) >= KEY_REPEAT_DELAY &&
+		(now - state.lastRepeat) >= KEY_REPEAT_INTERVAL)
+	{
+		state.lastRepeat = now;
+		action();
+	}
+}
 
 static void onReshadePresent(effect_runtime* runtime)
 {
@@ -439,6 +487,7 @@ static void onReshadePresent(effect_runtime* runtime)
 		}
 	}
 
+
 	// hardcoded hunting keys.
 	// If Ctrl is pressed too, it'll step to the next marked shader (if any)
 	// Numpad 1: previous pixel shader
@@ -450,42 +499,17 @@ static void onReshadePresent(effect_runtime* runtime)
 	// Numpad 7: previous compute shader
 	// Numpad 8: next compute shader
 	// Numpad 9: mark current compute shader as part of the toggle group
-	if(runtime->is_key_pressed(VK_NUMPAD1))
-	{
-		g_pixelShaderManager.huntPreviousShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD2))
-	{
-		g_pixelShaderManager.huntNextShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD3))
-	{
-		g_pixelShaderManager.toggleMarkOnHuntedShader();
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD4))
-	{
-		g_vertexShaderManager.huntPreviousShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD5))
-	{
-		g_vertexShaderManager.huntNextShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD6))
-	{
-		g_vertexShaderManager.toggleMarkOnHuntedShader();
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD7))
-	{
-		g_computeShaderManager.huntPreviousShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD8))
-	{
-		g_computeShaderManager.huntNextShader(runtime->is_key_down(VK_CONTROL));
-	}
-	if(runtime->is_key_pressed(VK_NUMPAD9))
-	{
-		g_computeShaderManager.toggleMarkOnHuntedShader();
-	}
+	const bool ctrlDown = runtime->is_key_down(VK_CONTROL);
+
+	handleHuntKey(runtime, VK_NUMPAD1, 0, [&]{ g_pixelShaderManager.huntPreviousShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD2, 1, [&]{ g_pixelShaderManager.huntNextShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD3, 2, [&]{ g_pixelShaderManager.toggleMarkOnHuntedShader(); });
+	handleHuntKey(runtime, VK_NUMPAD4, 3, [&]{ g_vertexShaderManager.huntPreviousShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD5, 4, [&]{ g_vertexShaderManager.huntNextShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD6, 5, [&]{ g_vertexShaderManager.toggleMarkOnHuntedShader(); });
+	handleHuntKey(runtime, VK_NUMPAD7, 6, [&]{ g_computeShaderManager.huntPreviousShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD8, 7, [&]{ g_computeShaderManager.huntNextShader(ctrlDown); });
+	handleHuntKey(runtime, VK_NUMPAD9, 8, [&]{ g_computeShaderManager.toggleMarkOnHuntedShader(); });
 }
 
 
