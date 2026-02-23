@@ -1,3 +1,14 @@
+# Strawberry ShaderToggler
+
+Custom reimplementation of Special K adapted for Where Winds Meet initially but should work elsewhere.
+
+All uses of this tool are purely cosmetic. It has no use in combat or lifeskilling.
+
+
+Original project copyright © FransBouma.
+Original repo: https://github.com/FransBouma/ShaderToggler
+
+
 # ShaderToggler
 Reshade 5.1+ addin to toggle game shaders on/off in groups based on a key press. It allows you to configure these groups from within the addin as well. 
 This addon is meant to toggle a game's shaders on/off, not reshade effects. 
