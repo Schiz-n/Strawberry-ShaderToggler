@@ -42,6 +42,8 @@
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include <unordered_set>
+#include <cstdio>
 
 using namespace reshade::api;
 using namespace ShaderToggler;
@@ -49,10 +51,13 @@ using namespace ShaderToggler;
 extern "C" __declspec(dllexport) const char *NAME = "Shader Toggler";
 extern "C" __declspec(dllexport) const char *DESCRIPTION = "Add-on which allows you to define groups of game shaders to toggle on/off with one key press.";
 
+static constexpr uint32_t MAX_PS_SRV_SLOTS = 128;
+
 struct __declspec(uuid("038B03AA-4C75-443B-A695-752D80797037")) CommandListDataContainer {
     uint64_t activePixelShaderPipeline;
     uint64_t activeVertexShaderPipeline;
 	uint64_t activeComputeShaderPipeline;
+    resource_view pixelSRVs[MAX_PS_SRV_SLOTS]; // current SRVs bound to the pixel-shader stage
 };
 
 #define FRAMECOUNT_COLLECTION_PHASE_DEFAULT 250;
@@ -80,6 +85,11 @@ static int g_keyRepeatDelayMs = 500;  // milliseconds before repeat starts
 static int g_keyRepeatIntervalMs = 125;  // milliseconds between repeats
 
 static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
+
+// Texture-export state
+static std::vector<resource_view> g_lastHuntedPixelSRVs;
+static std::vector<std::string>   g_exportResultLines;
+static bool                       g_showExportResult = false;
 
 /// <summary>
 /// Calculates a crc32 hash from the passed in shader bytecode. The hash is used to identity the shader in future runs.
@@ -194,6 +204,7 @@ static void onResetCommandList(command_list *commandList)
 	commandListData.activePixelShaderPipeline = -1;
 	commandListData.activeVertexShaderPipeline = -1;
 	commandListData.activeComputeShaderPipeline = -1;
+	memset(commandListData.pixelSRVs, 0, sizeof(commandListData.pixelSRVs));
 }
 
 
@@ -260,8 +271,245 @@ static void displayShaderManagerStats(ShaderManager& toDisplay, const char* shad
 }
 
 
+// -----------------------------------------------------------------------
+// Texture-export helpers
+// -----------------------------------------------------------------------
+
+static std::string toHexStr(uint32_t v)
+{
+	char buf[16];
+	snprintf(buf, sizeof(buf), "%08X", v);
+	return std::string(buf);
+}
+
+// Write width×height RGBA8 pixels as an uncompressed PNG.
+// Uses the zlib "stored" (no-compression) mode to avoid needing any library.
+static bool writePng(const std::string& path, uint32_t w, uint32_t h, const uint8_t* rgba)
+{
+	// Build scanlines: filter byte (0 = None) followed by raw RGBA pixels
+	const uint32_t rowBytes = w * 4;
+	std::vector<uint8_t> raw(h * (rowBytes + 1));
+	for (uint32_t y = 0; y < h; ++y)
+	{
+		raw[y * (rowBytes + 1)] = 0; // filter = None
+		memcpy(raw.data() + y * (rowBytes + 1) + 1, rgba + (size_t)y * rowBytes, rowBytes);
+	}
+
+	// Adler-32 of all raw scanline bytes
+	uint32_t a1 = 1, a2 = 0;
+	for (const uint8_t b : raw) { a1 = (a1 + b) % 65521; a2 = (a2 + a1) % 65521; }
+	const uint32_t adler = (a2 << 16) | a1;
+
+	// Build zlib "stored" stream (CMF=0x78, FLG=0x01: 0x7801 % 31 == 0)
+	std::vector<uint8_t> zlib;
+	zlib.push_back(0x78);
+	zlib.push_back(0x01);
+	for (size_t remaining = raw.size(); remaining > 0; )
+	{
+		const uint16_t blk  = (uint16_t)std::min<size_t>(remaining, 65535);
+		const uint16_t nblk = blk ^ 0xFFFFu;
+		zlib.push_back(remaining <= 65535 ? 0x01 : 0x00); // BFINAL | BTYPE=00
+		zlib.push_back(blk  & 0xFF); zlib.push_back((blk  >> 8) & 0xFF);
+		zlib.push_back(nblk & 0xFF); zlib.push_back((nblk >> 8) & 0xFF);
+		const uint8_t* ptr = raw.data() + (raw.size() - remaining);
+		zlib.insert(zlib.end(), ptr, ptr + blk);
+		remaining -= blk;
+	}
+	// Adler-32 big-endian
+	zlib.push_back((adler >> 24) & 0xFF); zlib.push_back((adler >> 16) & 0xFF);
+	zlib.push_back((adler >>  8) & 0xFF); zlib.push_back((adler      ) & 0xFF);
+
+	// Assemble PNG
+	std::vector<uint8_t> png;
+	auto u32be = [](std::vector<uint8_t>& v, uint32_t n) {
+		v.push_back((n>>24)&0xFF); v.push_back((n>>16)&0xFF);
+		v.push_back((n>> 8)&0xFF); v.push_back((n    )&0xFF);
+	};
+	auto writeChunk = [&](const char* t, const uint8_t* d, uint32_t len) {
+		u32be(png, len);
+		const size_t start = png.size();
+		png.push_back(t[0]); png.push_back(t[1]); png.push_back(t[2]); png.push_back(t[3]);
+		if (len && d) png.insert(png.end(), d, d + len);
+		u32be(png, compute_crc32(png.data() + start, 4 + len));
+	};
+
+	const uint8_t sig[8] = {137,80,78,71,13,10,26,10};
+	png.insert(png.end(), sig, sig + 8);
+
+	uint8_t ihdr[13];
+	ihdr[0]=(w>>24)&0xFF; ihdr[1]=(w>>16)&0xFF; ihdr[2]=(w>>8)&0xFF; ihdr[3]=w&0xFF;
+	ihdr[4]=(h>>24)&0xFF; ihdr[5]=(h>>16)&0xFF; ihdr[6]=(h>>8)&0xFF; ihdr[7]=h&0xFF;
+	ihdr[8]=8; ihdr[9]=6; ihdr[10]=0; ihdr[11]=0; ihdr[12]=0;
+	writeChunk("IHDR", ihdr, 13);
+	writeChunk("IDAT", zlib.data(), (uint32_t)zlib.size());
+	writeChunk("IEND", nullptr, 0);
+
+	FILE* f = nullptr;
+	if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+	fwrite(png.data(), 1, png.size(), f);
+	fclose(f);
+	return true;
+}
+
+// Export every unique 2D RGBA/BGRA texture currently bound to the hunted pixel shader.
+static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t shaderHash)
+{
+	std::vector<std::string> results;
+
+	if (g_lastHuntedPixelSRVs.empty())
+	{
+		results.push_back("Nothing to export - shader did not draw this frame.");
+		return results;
+	}
+
+	device*        dev   = runtime->get_command_queue()->get_device();
+	command_queue* queue = runtime->get_command_queue();
+	command_list*  cmd   = queue->get_immediate_command_list();
+	if (!cmd) { results.push_back("Error: no immediate command list."); return results; }
+
+	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path();
+	std::unordered_set<uint64_t> seen;
+	int n = 0;
+
+	for (const resource_view& srv : g_lastHuntedPixelSRVs)
+	{
+		if (!srv.handle) continue;
+
+		const resource res = dev->get_resource_from_view(srv);
+		if (!res.handle || seen.count(res.handle)) continue;
+		seen.insert(res.handle);
+
+		const resource_desc desc = dev->get_resource_desc(res);
+		if (desc.type != resource_type::texture_2d) continue;
+		if (desc.texture.samples > 1) { results.push_back("Skipped MSAA texture."); continue; }
+
+		const auto fmt     = desc.texture.format;
+		const bool isBGRA8 = (fmt == format::b8g8r8a8_unorm     || fmt == format::b8g8r8a8_unorm_srgb
+		                   || fmt == format::b8g8r8a8_typeless);
+		const bool isRGBA8 = (fmt == format::r8g8b8a8_unorm     || fmt == format::r8g8b8a8_unorm_srgb
+		                   || fmt == format::r8g8b8a8_typeless);
+		if (!isBGRA8 && !isRGBA8)
+		{
+			results.push_back("Skipped: unsupported format " + std::to_string((int)fmt) + ".");
+			continue;
+		}
+
+		const uint32_t w = desc.texture.width;
+		const uint32_t h = desc.texture.height;
+
+		// Create a CPU-readable staging texture
+		resource staging = {0};
+		const resource_desc stagingDesc(w, h, 1, 1, fmt, 1, memory_heap::gpu_to_cpu, resource_usage::copy_dest);
+		if (!dev->create_resource(stagingDesc, nullptr, resource_usage::copy_dest, &staging))
+		{
+			results.push_back("Slot " + std::to_string(n) + ": staging alloc failed.");
+			continue;
+		}
+
+		// Copy GPU texture → staging, flush, wait
+		cmd->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
+		cmd->copy_resource(res, staging);
+		cmd->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
+		queue->flush_immediate_command_list();
+		queue->wait_idle();
+
+		// Map staging and convert to RGBA8
+		subresource_data data = {};
+		if (dev->map_texture_region(staging, 0, nullptr, map_access::read_only, &data) && data.data)
+		{
+			std::vector<uint8_t> pixels((size_t)w * h * 4);
+			const auto* src = static_cast<const uint8_t*>(data.data);
+			for (uint32_t y = 0; y < h; ++y)
+			{
+				const uint8_t* row = src + (size_t)y * data.row_pitch;
+				uint8_t*       dst = pixels.data() + (size_t)y * w * 4;
+				if (isBGRA8)
+					for (uint32_t x = 0; x < w; ++x)
+					{ dst[x*4]=row[x*4+2]; dst[x*4+1]=row[x*4+1]; dst[x*4+2]=row[x*4+0]; dst[x*4+3]=row[x*4+3]; }
+				else
+					memcpy(dst, row, (size_t)w * 4);
+			}
+			dev->unmap_texture_region(staging, 0);
+
+			const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + std::to_string(n) + ".png";
+			if (writePng((exportDir / fname).string(), w, h, pixels.data()))
+				results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
+			else
+				results.push_back(fname + ": write failed.");
+			++n;
+		}
+		else
+		{
+			results.push_back("Slot " + std::to_string(n) + ": map failed.");
+		}
+
+		dev->destroy_resource(staging);
+	}
+
+	if (results.empty())
+		results.push_back("No exportable textures found (all formats unsupported).");
+	return results;
+}
+
+// Track resource views bound to the pixel-shader stage.
+static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeline_layout, uint32_t,
+                               const descriptor_set_update& update)
+{
+	if ((stages & shader_stage::pixel) == shader_stage::pixel
+	    && update.type == descriptor_type::shader_resource_view
+	    && update.count > 0 && update.descriptors)
+	{
+		auto& data = cmdList->get_private_data<CommandListDataContainer>();
+		const resource_view* views = static_cast<const resource_view*>(update.descriptors);
+		for (uint32_t i = 0; i < update.count; ++i)
+		{
+			const uint32_t slot = update.binding + i;
+			if (slot < MAX_PS_SRV_SLOTS)
+				data.pixelSRVs[slot] = views[i];
+		}
+	}
+}
+
+// If the draw call is using the currently hunted pixel shader, snapshot its SRVs.
+static void captureHuntedShaderSRVs(command_list* commandList)
+{
+	if (!g_pixelShaderManager.isInHuntingMode() || g_activeCollectorFrameCounter > 0) return;
+	const uint32_t huntedHash = g_pixelShaderManager.getActiveHuntedShaderHash();
+	if (!huntedHash) return;
+
+	const CommandListDataContainer& data    = commandList->get_private_data<CommandListDataContainer>();
+	const uint32_t                  current = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
+	if (current != huntedHash) return;
+
+	g_lastHuntedPixelSRVs.clear();
+	for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
+		if (data.pixelSRVs[i].handle)
+			g_lastHuntedPixelSRVs.push_back(data.pixelSRVs[i]);
+}
+
 static void onReshadeOverlay(reshade::api::effect_runtime *runtime)
 {
+	// Export-result popup
+	if (g_showExportResult)
+	{
+		ImGui::SetNextWindowBgAlpha(0.92f);
+		ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+		if (ImGui::Begin("##ExportResult", nullptr,
+		                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize |
+		                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove))
+		{
+			ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Texture Export (Numpad 0)");
+			ImGui::Separator();
+			for (const auto& line : g_exportResultLines)
+				ImGui::Text("%s", line.c_str());
+			ImGui::Separator();
+			if (ImGui::Button("  OK  "))
+				g_showExportResult = false;
+		}
+		ImGui::End();
+		return;
+	}
+
 	if(g_toggleGroupIdShaderEditing>=0)
 	{
 		ImGui::SetNextWindowBgAlpha(g_overlayOpacity);
@@ -419,14 +667,14 @@ bool blockDrawCallForCommandList(command_list* commandList)
 
 static bool onDraw(command_list* commandList, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance)
 {
-	// check if for this command list the active shader handles are part of the blocked set. If so, return true
+	captureHuntedShaderSRVs(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
 
 
 static bool onDrawIndexed(command_list* commandList, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 {
-	// same as onDraw
+	captureHuntedShaderSRVs(commandList);
 	return blockDrawCallForCommandList(commandList);
 }
 
@@ -439,7 +687,7 @@ static bool onDrawOrDispatchIndirect(command_list* commandList, indirect_command
 		case indirect_command::draw:
 		case indirect_command::draw_indexed:
 		case indirect_command::dispatch:
-			// same as OnDraw
+			captureHuntedShaderSRVs(commandList);
 			return blockDrawCallForCommandList(commandList);
 		// the rest aren't blocked
 	}
@@ -522,6 +770,16 @@ static void onReshadePresent(effect_runtime* runtime)
 	handleHuntKey(runtime, VK_NUMPAD7, 6, [&]{ g_computeShaderManager.huntPreviousShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD8, 7, [&]{ g_computeShaderManager.huntNextShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD9, 8, [&]{ g_computeShaderManager.toggleMarkOnHuntedShader(); });
+
+	// Numpad 0: export textures bound to the currently hunted pixel shader
+	if (runtime->is_key_pressed(VK_NUMPAD0)
+	    && g_pixelShaderManager.isInHuntingMode()
+	    && g_activeCollectorFrameCounter == 0
+	    && g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
+	{
+		g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+		g_showExportResult  = true;
+	}
 }
 
 
@@ -638,6 +896,7 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::TextUnformatted("* Numpad 7 and Numpad 8: previous/next compute shader");
 		ImGui::TextUnformatted("* Ctrl + Numpad 7 and Ctrl + Numpad 8: previous/next marked compute shader in the group");
 		ImGui::TextUnformatted("* Numpad 9: mark/unmark the current compute shader as being part of the group");
+		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files");
 		ImGui::TextUnformatted("\nWhen you step through the shaders, the current shader is disabled in the 3D scene so you can see if that's the shader you were looking for.");
 		ImGui::TextUnformatted("When you're done, make sure you click 'Save all toggle groups' to preserve the groups you defined so next time you start your game they're loaded in and you can use them right away.");
 		ImGui::PopTextWrapPos();
@@ -863,6 +1122,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::draw>(onDraw);
 			reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 			reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 			reshade::register_overlay(nullptr, &displaySettings);
 			loadShaderTogglerIniFile();
 		}
@@ -876,6 +1136,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::unregister_event<reshade::addon_event::draw>(onDraw);
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 		reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+		reshade::unregister_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 		reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
 		reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
 		reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
