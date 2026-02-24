@@ -42,6 +42,7 @@
 #include <vector>
 #include <filesystem>
 #include <chrono>
+#include "TextureExporter.h"
 
 using namespace reshade::api;
 using namespace ShaderToggler;
@@ -69,6 +70,9 @@ static atomic_int g_toggleGroupIdShaderEditing = -1;
 static float g_overlayOpacity = 1.0f;
 static int g_startValueFramecountCollectionPhase = FRAMECOUNT_COLLECTION_PHASE_DEFAULT;
 static std::string g_iniFileName = "";
+
+static ShaderToggler::TextureExporter g_textureExporter;
+static std::string g_exportFolder = "";   // set in DllMain alongside g_iniFileName
 // Key repeat state for shader hunting
 struct KeyRepeatState {
 	bool isHeld = false;
@@ -512,7 +516,14 @@ static void onReshadePresent(effect_runtime* runtime)
 	// Numpad 8: next compute shader
 	// Numpad 9: mark current compute shader as part of the toggle group
 	const bool ctrlDown = runtime->is_key_down(VK_CONTROL);
-
+	if (runtime->is_key_pressed(VK_NUMPAD0))
+	{
+		if (g_pixelShaderManager.isInHuntingMode() &&
+			g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
+		{
+			g_textureExporter.flagCapture();
+		}
+	}
 	handleHuntKey(runtime, VK_NUMPAD1, 0, [&]{ g_pixelShaderManager.huntPreviousShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD2, 1, [&]{ g_pixelShaderManager.huntNextShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD3, 2, [&]{ g_pixelShaderManager.toggleMarkOnHuntedShader(); });
@@ -522,6 +533,23 @@ static void onReshadePresent(effect_runtime* runtime)
 	handleHuntKey(runtime, VK_NUMPAD7, 6, [&]{ g_computeShaderManager.huntPreviousShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD8, 7, [&]{ g_computeShaderManager.huntNextShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD9, 8, [&]{ g_computeShaderManager.toggleMarkOnHuntedShader(); });
+	if (g_textureExporter.hasPendingCapture())
+	{
+		// requestCapture needs a command list — use the one from present
+		// Note: runtime->get_command_queue()->get_immediate_command_list() gives us one
+		reshade::api::command_list* cmdList =
+			runtime->get_command_queue()->get_immediate_command_list();
+
+		g_textureExporter.requestCapture(
+			cmdList,
+			runtime->get_device(),
+			g_pixelShaderManager.getActiveHuntedShaderHash());
+	}
+	else
+	{
+		g_textureExporter.processPendingCaptures(
+			runtime->get_device(), g_exportFolder);
+	}
 }
 
 
@@ -833,6 +861,22 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 	}
 }
 
+void onPushDescriptors(command_list* cmdList, shader_stage stages,
+	pipeline_layout layout, uint32_t param,
+	uint32_t count,
+	descriptor_type type, const void* descriptors)
+{
+	if (!g_textureExporter.hasPendingCapture()) return;
+	if ((stages & shader_stage::pixel) != shader_stage::pixel) return;
+	if (type != descriptor_type::shader_resource_view) return;
+
+	std::vector<reshade::api::resource_view> views;
+	const auto* rvs = static_cast<const reshade::api::resource_view*>(descriptors);
+	for (uint32_t i = 0; i < count; i++)
+		views.push_back(rvs[i]);
+
+	g_textureExporter.setSourceDescriptors(views);
+}
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 {
@@ -851,6 +895,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			const std::filesystem::path dllPath = GetModuleFileNameW(nullptr, buf, ARRAYSIZE(buf)) ? buf : std::filesystem::path();		// <installpath>/shadertoggler.addon64
 			const std::filesystem::path basePath = dllPath.parent_path();																// <installpath>
 			const std::string& hashFileName = HASH_FILE_NAME;
+			g_exportFolder = (basePath / "ShaderToggler_exports/").string();
+			std::filesystem::create_directories(g_exportFolder);
 			g_iniFileName = (basePath / hashFileName).string();																			// <installpath>/shadertoggler.ini
 			reshade::register_event<reshade::addon_event::init_pipeline>(onInitPipeline);
 			reshade::register_event<reshade::addon_event::init_command_list>(onInitCommandList);
@@ -863,6 +909,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::draw>(onDraw);
 			reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 			reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
+			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 			reshade::register_overlay(nullptr, &displaySettings);
 			loadShaderTogglerIniFile();
 		}
@@ -879,6 +926,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
 		reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
 		reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
+		reshade::unregister_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
 		reshade::unregister_overlay(nullptr, &displaySettings);
 		reshade::unregister_addon(hModule);
 		break;

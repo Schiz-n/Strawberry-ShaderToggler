@@ -92,7 +92,7 @@ namespace ShaderToggler
 
 		uint32_t getPipelineCount() {return _handleToShaderHash.size();}
 		uint32_t getShaderCount() { return _shaderHashes.size();}
-		uint32_t getAmountShaderHashesCollected() { return _collectedActiveShaderHashes.size(); }
+		uint32_t getAmountShaderHashesCollected() { return static_cast<uint32_t>(_collectedActiveShaderHashes.size()); }
 		bool isInHuntingMode() { return _isInHuntingMode;}
 		uint32_t getActiveHuntedShaderHash() { return _activeHuntedShaderHash;}
 		int getActiveHuntedShaderIndex() { return _activeHuntedShaderIndex; }
