@@ -351,7 +351,121 @@ static bool writePng(const std::string& path, uint32_t w, uint32_t h, const uint
 	return true;
 }
 
-// Export every unique 2D RGBA/BGRA texture currently bound to the hunted pixel shader.
+// Returns bytes per 4x4 block for BCn compressed formats, 0 if not block-compressed.
+static uint32_t getBCBlockSize(format fmt)
+{
+	switch (fmt)
+	{
+	case format::bc1_typeless: case format::bc1_unorm: case format::bc1_unorm_srgb:
+	case format::bc4_typeless: case format::bc4_unorm: case format::bc4_snorm:
+		return 8;
+	case format::bc2_typeless: case format::bc2_unorm: case format::bc2_unorm_srgb:
+	case format::bc3_typeless: case format::bc3_unorm: case format::bc3_unorm_srgb:
+	case format::bc5_typeless: case format::bc5_unorm: case format::bc5_snorm:
+	case format::bc6h_typeless: case format::bc6h_ufloat: case format::bc6h_sfloat:
+	case format::bc7_typeless: case format::bc7_unorm: case format::bc7_unorm_srgb:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+// Returns bytes per pixel for uncompressed textures, 0 if unknown.
+static uint32_t getUncompressedBPP(format fmt)
+{
+	switch (fmt)
+	{
+	case format::r8_typeless: case format::r8_unorm: case format::r8_uint:
+	case format::r8_snorm:    case format::r8_sint:
+		return 1;
+	case format::r8g8_typeless: case format::r8g8_unorm: case format::r8g8_uint:
+	case format::r8g8_snorm:    case format::r8g8_sint:
+	case format::r16_typeless:  case format::r16_float:  case format::r16_unorm:
+	case format::r16_uint:      case format::r16_snorm:  case format::r16_sint:
+		return 2;
+	case format::r8g8b8a8_typeless:  case format::r8g8b8a8_unorm:      case format::r8g8b8a8_unorm_srgb:
+	case format::r8g8b8a8_uint:      case format::r8g8b8a8_snorm:      case format::r8g8b8a8_sint:
+	case format::b8g8r8a8_typeless:  case format::b8g8r8a8_unorm:      case format::b8g8r8a8_unorm_srgb:
+	case format::b8g8r8x8_typeless:  case format::b8g8r8x8_unorm:      case format::b8g8r8x8_unorm_srgb:
+	case format::r10g10b10a2_typeless: case format::r10g10b10a2_unorm: case format::r10g10b10a2_uint:
+	case format::r10g10b10a2_xr_bias: case format::r11g11b10_float:    case format::r9g9b9e5:
+	case format::r16g16_typeless:    case format::r16g16_float:        case format::r16g16_unorm:
+	case format::r16g16_uint:        case format::r16g16_snorm:        case format::r16g16_sint:
+	case format::r32_typeless:       case format::r32_float:           case format::r32_uint:
+	case format::r32_sint:
+		return 4;
+	case format::r16g16b16a16_typeless: case format::r16g16b16a16_float: case format::r16g16b16a16_unorm:
+	case format::r16g16b16a16_uint:     case format::r16g16b16a16_snorm: case format::r16g16b16a16_sint:
+	case format::r32g32_typeless:       case format::r32g32_float:       case format::r32g32_uint:
+	case format::r32g32_sint:
+		return 8;
+	case format::r32g32b32_typeless: case format::r32g32b32_float:
+	case format::r32g32b32_uint:     case format::r32g32b32_sint:
+		return 12;
+	case format::r32g32b32a32_typeless: case format::r32g32b32a32_float:
+	case format::r32g32b32a32_uint:     case format::r32g32b32a32_sint:
+		return 16;
+	default:
+		return 0;
+	}
+}
+
+// Write a 2D texture as a DDS file (DX10 extension, mip 0 only).
+// data/rowPitch come directly from map_texture_region.
+static bool writeDds(const std::string& path, uint32_t w, uint32_t h, format fmt,
+                     const uint8_t* data, uint32_t rowPitch)
+{
+	const uint32_t dxgiFormat = (uint32_t)format_to_default_typed(fmt, 0);
+	const uint32_t blockSz    = getBCBlockSize(fmt);
+	const bool     isBC       = (blockSz > 0);
+	uint32_t       numRows, tightPitch;
+	if (isBC)
+	{
+		numRows    = (h + 3) / 4;
+		tightPitch = (w + 3) / 4 * blockSz;
+	}
+	else
+	{
+		const uint32_t bpp = getUncompressedBPP(fmt);
+		if (!bpp) return false;
+		numRows    = h;
+		tightPitch = w * bpp;
+	}
+
+	struct PF  { uint32_t size,flags,fourCC,rgbBits,rM,gM,bM,aM; };
+	struct HDR { uint32_t size,flags,h,w,pitchLin,depth,mips; uint32_t res1[11]; PF pf; uint32_t caps,c2,c3,c4,res2; };
+	struct DX10{ uint32_t fmt,dim,misc,arr,misc2; };
+
+	HDR hdr  = {};
+	hdr.size    = 124;
+	hdr.flags   = 0x1u|0x2u|0x4u|0x1000u | (isBC ? 0x80000u : 0x8u);
+	hdr.h       = h;  hdr.w = w;
+	hdr.pitchLin = isBC ? numRows * tightPitch : tightPitch;
+	hdr.mips    = 1;
+	hdr.pf.size  = 32;
+	hdr.pf.flags = 0x4u;
+	hdr.pf.fourCC = 0x30315844u; // 'DX10'
+	hdr.caps    = 0x1000u;
+
+	DX10 dx10 = {};
+	dx10.fmt  = dxgiFormat;
+	dx10.dim  = 3; // D3D10_RESOURCE_DIMENSION_TEXTURE2D
+	dx10.arr  = 1;
+
+	FILE* f = nullptr;
+	if (fopen_s(&f, path.c_str(), "wb") != 0 || !f) return false;
+	const uint32_t magic = 0x20534444u;
+	fwrite(&magic, 4, 1, f);
+	fwrite(&hdr,  sizeof(hdr),  1, f);
+	fwrite(&dx10, sizeof(dx10), 1, f);
+	for (uint32_t row = 0; row < numRows; ++row)
+		fwrite(data + (size_t)row * rowPitch, 1, tightPitch, f);
+	fclose(f);
+	return true;
+}
+
+// Export every unique 2D texture currently bound to the hunted pixel shader.
+// RGBA8/BGRA8 → PNG; everything else (BCn, float, HDR, …) → DDS.
 static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t shaderHash)
 {
 	std::vector<std::string> results;
