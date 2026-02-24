@@ -1,4 +1,4 @@
-﻿///////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////
 //
 // Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
 // to define groups of shaders to toggle them on/off with one key press
@@ -43,6 +43,9 @@
 #include <filesystem>
 #include <chrono>
 #include <unordered_set>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <cstdio>
 
 using namespace reshade::api;
@@ -282,7 +285,723 @@ static std::string toHexStr(uint32_t v)
 	return std::string(buf);
 }
 
-// Write width×height RGBA8 pixels as an uncompressed PNG.
+static uint8_t toByteUnorm(float v)
+{
+	const float clamped = std::clamp(v, 0.0f, 1.0f);
+	return static_cast<uint8_t>(clamped * 255.0f + 0.5f);
+}
+
+static uint8_t toByteSnorm(float v)
+{
+	const float clamped = std::clamp(v, -1.0f, 1.0f);
+	return toByteUnorm(clamped * 0.5f + 0.5f);
+}
+
+static uint8_t toByteUInt(uint32_t v, uint32_t maxV)
+{
+	if (maxV == 0) return 0;
+	const uint64_t num = static_cast<uint64_t>(v) * 255ull + (static_cast<uint64_t>(maxV) / 2ull);
+	return static_cast<uint8_t>(num / static_cast<uint64_t>(maxV));
+}
+
+static float halfToFloat(uint16_t h)
+{
+	const uint32_t sign = (h & 0x8000u) << 16;
+	uint32_t exponent = (h >> 10) & 0x1Fu;
+	uint32_t mantissa = h & 0x03FFu;
+	uint32_t bits = 0;
+
+	if (exponent == 0)
+	{
+		if (mantissa == 0)
+		{
+			bits = sign;
+		}
+		else
+		{
+			int32_t e = -14;
+			while ((mantissa & 0x0400u) == 0)
+			{
+				mantissa <<= 1;
+				--e;
+			}
+			mantissa &= 0x03FFu;
+			bits = sign | static_cast<uint32_t>((e + 127) << 23) | (mantissa << 13);
+		}
+	}
+	else if (exponent == 0x1Fu)
+	{
+		bits = sign | 0x7F800000u | (mantissa << 13);
+	}
+	else
+	{
+		bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+	}
+
+	float out = 0.0f;
+	memcpy(&out, &bits, sizeof(out));
+	return out;
+}
+
+static void decode565ToRgb(uint16_t c, uint8_t &r, uint8_t &g, uint8_t &b)
+{
+	r = toByteUInt((c >> 11) & 0x1Fu, 31u);
+	g = toByteUInt((c >> 5) & 0x3Fu, 63u);
+	b = toByteUInt(c & 0x1Fu, 31u);
+}
+
+static void decodeBc1Palette(uint16_t c0, uint16_t c1, bool allow1BitAlpha, uint8_t palette[4][4])
+{
+	decode565ToRgb(c0, palette[0][0], palette[0][1], palette[0][2]); palette[0][3] = 255;
+	decode565ToRgb(c1, palette[1][0], palette[1][1], palette[1][2]); palette[1][3] = 255;
+
+	if (c0 > c1 || !allow1BitAlpha)
+	{
+		palette[2][0] = static_cast<uint8_t>((2 * palette[0][0] + palette[1][0]) / 3);
+		palette[2][1] = static_cast<uint8_t>((2 * palette[0][1] + palette[1][1]) / 3);
+		palette[2][2] = static_cast<uint8_t>((2 * palette[0][2] + palette[1][2]) / 3);
+		palette[2][3] = 255;
+		palette[3][0] = static_cast<uint8_t>((palette[0][0] + 2 * palette[1][0]) / 3);
+		palette[3][1] = static_cast<uint8_t>((palette[0][1] + 2 * palette[1][1]) / 3);
+		palette[3][2] = static_cast<uint8_t>((palette[0][2] + 2 * palette[1][2]) / 3);
+		palette[3][3] = 255;
+	}
+	else
+	{
+		palette[2][0] = static_cast<uint8_t>((palette[0][0] + palette[1][0]) / 2);
+		palette[2][1] = static_cast<uint8_t>((palette[0][1] + palette[1][1]) / 2);
+		palette[2][2] = static_cast<uint8_t>((palette[0][2] + palette[1][2]) / 2);
+		palette[2][3] = 255;
+		palette[3][0] = 0;
+		palette[3][1] = 0;
+		palette[3][2] = 0;
+		palette[3][3] = 0;
+	}
+}
+
+static void decodeBc4BlockUnorm(const uint8_t *block, uint8_t out[16])
+{
+	const uint8_t a0 = block[0];
+	const uint8_t a1 = block[1];
+	uint8_t palette[8];
+	palette[0] = a0;
+	palette[1] = a1;
+
+	if (a0 > a1)
+	{
+		for (int i = 1; i <= 6; ++i)
+			palette[i + 1] = static_cast<uint8_t>(((7 - i) * a0 + i * a1) / 7);
+	}
+	else
+	{
+		for (int i = 1; i <= 4; ++i)
+			palette[i + 1] = static_cast<uint8_t>(((5 - i) * a0 + i * a1) / 5);
+		palette[6] = 0;
+		palette[7] = 255;
+	}
+
+	uint64_t idx = 0;
+	for (int i = 0; i < 6; ++i)
+		idx |= static_cast<uint64_t>(block[2 + i]) << (8 * i);
+
+	for (int i = 0; i < 16; ++i)
+		out[i] = palette[(idx >> (3 * i)) & 0x7];
+}
+
+static void decodeBc4BlockSnorm(const uint8_t *block, uint8_t out[16])
+{
+	const int8_t a0 = static_cast<int8_t>(block[0]);
+	const int8_t a1 = static_cast<int8_t>(block[1]);
+	int16_t palette[8];
+	palette[0] = a0;
+	palette[1] = a1;
+
+	if (a0 > a1)
+	{
+		for (int i = 1; i <= 6; ++i)
+			palette[i + 1] = static_cast<int16_t>(((7 - i) * a0 + i * a1) / 7);
+	}
+	else
+	{
+		for (int i = 1; i <= 4; ++i)
+			palette[i + 1] = static_cast<int16_t>(((5 - i) * a0 + i * a1) / 5);
+		palette[6] = -127;
+		palette[7] = 127;
+	}
+
+	uint64_t idx = 0;
+	for (int i = 0; i < 6; ++i)
+		idx |= static_cast<uint64_t>(block[2 + i]) << (8 * i);
+
+	for (int i = 0; i < 16; ++i)
+		out[i] = toByteSnorm(static_cast<float>(palette[(idx >> (3 * i)) & 0x7]) / 127.0f);
+}
+
+static bool convertMappedTextureToRgba8(reshade::api::format fmtIn, const subresource_data &data, uint32_t w, uint32_t h, std::vector<uint8_t> &pixels)
+{
+	const reshade::api::format fmt = format_to_default_typed(fmtIn, 0);
+	const uint8_t *src = static_cast<const uint8_t *>(data.data);
+	if (src == nullptr) return false;
+
+	pixels.resize(static_cast<size_t>(w) * h * 4);
+
+	auto writePixel = [&](uint32_t px, uint32_t py, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+	{
+		if (px >= w || py >= h) return;
+		const size_t idx = (static_cast<size_t>(py) * w + px) * 4;
+		pixels[idx + 0] = r;
+		pixels[idx + 1] = g;
+		pixels[idx + 2] = b;
+		pixels[idx + 3] = a;
+	};
+
+	if (fmt == format::bc1_unorm || fmt == format::bc1_unorm_srgb ||
+		fmt == format::bc2_unorm || fmt == format::bc2_unorm_srgb ||
+		fmt == format::bc3_unorm || fmt == format::bc3_unorm_srgb ||
+		fmt == format::bc4_unorm || fmt == format::bc4_snorm ||
+		fmt == format::bc5_unorm || fmt == format::bc5_snorm)
+	{
+		const uint32_t blockSize = (fmt == format::bc1_unorm || fmt == format::bc1_unorm_srgb || fmt == format::bc4_unorm || fmt == format::bc4_snorm) ? 8 : 16;
+		const uint32_t blockWidth = (w + 3) / 4;
+		const uint32_t blockHeight = (h + 3) / 4;
+
+		for (uint32_t by = 0; by < blockHeight; ++by)
+		{
+			const uint8_t *row = src + static_cast<size_t>(by) * data.row_pitch;
+			for (uint32_t bx = 0; bx < blockWidth; ++bx)
+			{
+				const uint8_t *block = row + static_cast<size_t>(bx) * blockSize;
+
+				if (fmt == format::bc1_unorm || fmt == format::bc1_unorm_srgb)
+				{
+					const uint16_t c0 = static_cast<uint16_t>(block[0] | (block[1] << 8));
+					const uint16_t c1 = static_cast<uint16_t>(block[2] | (block[3] << 8));
+					const uint32_t indices = static_cast<uint32_t>(block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24));
+					uint8_t palette[4][4];
+					decodeBc1Palette(c0, c1, true, palette);
+					for (uint32_t py = 0; py < 4; ++py)
+						for (uint32_t px = 0; px < 4; ++px)
+						{
+							const uint32_t i = py * 4 + px;
+							const uint8_t p = static_cast<uint8_t>((indices >> (i * 2)) & 0x3);
+							writePixel(bx * 4 + px, by * 4 + py, palette[p][0], palette[p][1], palette[p][2], palette[p][3]);
+						}
+				}
+				else if (fmt == format::bc2_unorm || fmt == format::bc2_unorm_srgb)
+				{
+					uint64_t alphaBits = 0;
+					for (int i = 0; i < 8; ++i) alphaBits |= static_cast<uint64_t>(block[i]) << (8 * i);
+
+					const uint16_t c0 = static_cast<uint16_t>(block[8] | (block[9] << 8));
+					const uint16_t c1 = static_cast<uint16_t>(block[10] | (block[11] << 8));
+					const uint32_t indices = static_cast<uint32_t>(block[12] | (block[13] << 8) | (block[14] << 16) | (block[15] << 24));
+					uint8_t palette[4][4];
+					decodeBc1Palette(c0, c1, false, palette);
+					for (uint32_t py = 0; py < 4; ++py)
+						for (uint32_t px = 0; px < 4; ++px)
+						{
+							const uint32_t i = py * 4 + px;
+							const uint8_t p = static_cast<uint8_t>((indices >> (i * 2)) & 0x3);
+							const uint8_t a = static_cast<uint8_t>(((alphaBits >> (i * 4)) & 0xFu) * 17u);
+							writePixel(bx * 4 + px, by * 4 + py, palette[p][0], palette[p][1], palette[p][2], a);
+						}
+				}
+				else if (fmt == format::bc3_unorm || fmt == format::bc3_unorm_srgb)
+				{
+					uint8_t alphaPalette[8];
+					alphaPalette[0] = block[0];
+					alphaPalette[1] = block[1];
+					if (alphaPalette[0] > alphaPalette[1])
+					{
+						for (int i = 1; i <= 6; ++i)
+							alphaPalette[i + 1] = static_cast<uint8_t>(((7 - i) * alphaPalette[0] + i * alphaPalette[1]) / 7);
+					}
+					else
+					{
+						for (int i = 1; i <= 4; ++i)
+							alphaPalette[i + 1] = static_cast<uint8_t>(((5 - i) * alphaPalette[0] + i * alphaPalette[1]) / 5);
+						alphaPalette[6] = 0;
+						alphaPalette[7] = 255;
+					}
+
+					uint64_t alphaIdx = 0;
+					for (int i = 0; i < 6; ++i) alphaIdx |= static_cast<uint64_t>(block[2 + i]) << (8 * i);
+
+					const uint16_t c0 = static_cast<uint16_t>(block[8] | (block[9] << 8));
+					const uint16_t c1 = static_cast<uint16_t>(block[10] | (block[11] << 8));
+					const uint32_t indices = static_cast<uint32_t>(block[12] | (block[13] << 8) | (block[14] << 16) | (block[15] << 24));
+					uint8_t palette[4][4];
+					decodeBc1Palette(c0, c1, false, palette);
+					for (uint32_t py = 0; py < 4; ++py)
+						for (uint32_t px = 0; px < 4; ++px)
+						{
+							const uint32_t i = py * 4 + px;
+							const uint8_t p = static_cast<uint8_t>((indices >> (i * 2)) & 0x3);
+							const uint8_t a = alphaPalette[(alphaIdx >> (i * 3)) & 0x7];
+							writePixel(bx * 4 + px, by * 4 + py, palette[p][0], palette[p][1], palette[p][2], a);
+						}
+				}
+				else if (fmt == format::bc4_unorm || fmt == format::bc4_snorm)
+				{
+					uint8_t chan[16];
+					if (fmt == format::bc4_unorm) decodeBc4BlockUnorm(block, chan);
+					else decodeBc4BlockSnorm(block, chan);
+					for (uint32_t py = 0; py < 4; ++py)
+						for (uint32_t px = 0; px < 4; ++px)
+						{
+							const uint8_t v = chan[py * 4 + px];
+							writePixel(bx * 4 + px, by * 4 + py, v, v, v, 255);
+						}
+				}
+				else
+				{
+					uint8_t rChan[16], gChan[16];
+					if (fmt == format::bc5_unorm)
+					{
+						decodeBc4BlockUnorm(block, rChan);
+						decodeBc4BlockUnorm(block + 8, gChan);
+					}
+					else
+					{
+						decodeBc4BlockSnorm(block, rChan);
+						decodeBc4BlockSnorm(block + 8, gChan);
+					}
+
+					for (uint32_t py = 0; py < 4; ++py)
+						for (uint32_t px = 0; px < 4; ++px)
+						{
+							const uint32_t i = py * 4 + px;
+							writePixel(bx * 4 + px, by * 4 + py, rChan[i], gChan[i], 0, 255);
+						}
+				}
+			}
+		}
+
+		return true;
+	}
+
+	for (uint32_t y = 0; y < h; ++y)
+	{
+		const uint8_t *row = src + static_cast<size_t>(y) * data.row_pitch;
+		uint8_t *dst = pixels.data() + static_cast<size_t>(y) * w * 4;
+
+		for (uint32_t x = 0; x < w; ++x)
+		{
+			uint8_t r = 0, g = 0, b = 0, a = 255;
+
+			switch (fmt)
+			{
+			case format::b8g8r8a8_unorm:
+			case format::b8g8r8a8_unorm_srgb:
+				b = row[x * 4 + 0];
+				g = row[x * 4 + 1];
+				r = row[x * 4 + 2];
+				a = row[x * 4 + 3];
+				break;
+			case format::b8g8r8x8_unorm:
+			case format::b8g8r8x8_unorm_srgb:
+				b = row[x * 4 + 0];
+				g = row[x * 4 + 1];
+				r = row[x * 4 + 2];
+				a = 255;
+				break;
+			case format::r8g8b8a8_unorm:
+			case format::r8g8b8a8_unorm_srgb:
+				r = row[x * 4 + 0];
+				g = row[x * 4 + 1];
+				b = row[x * 4 + 2];
+				a = row[x * 4 + 3];
+				break;
+			case format::r8g8b8x8_unorm:
+			case format::r8g8b8x8_unorm_srgb:
+				r = row[x * 4 + 0];
+				g = row[x * 4 + 1];
+				b = row[x * 4 + 2];
+				a = 255;
+				break;
+			case format::r8g8b8a8_uint:
+				r = toByteUInt(row[x * 4 + 0], 255);
+				g = toByteUInt(row[x * 4 + 1], 255);
+				b = toByteUInt(row[x * 4 + 2], 255);
+				a = toByteUInt(row[x * 4 + 3], 255);
+				break;
+			case format::r8g8b8a8_sint:
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 0])) / 127.0f);
+				g = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 1])) / 127.0f);
+				b = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 2])) / 127.0f);
+				a = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 3])) / 127.0f);
+				break;
+			case format::r8g8b8a8_snorm:
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 0])) / 127.0f);
+				g = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 1])) / 127.0f);
+				b = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 2])) / 127.0f);
+				a = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 4 + 3])) / 127.0f);
+				break;
+			case format::r10g10b10a2_unorm:
+			{
+				const uint32_t packed = reinterpret_cast<const uint32_t *>(row)[x];
+				r = toByteUInt((packed >> 0) & 0x3FFu, 1023u);
+				g = toByteUInt((packed >> 10) & 0x3FFu, 1023u);
+				b = toByteUInt((packed >> 20) & 0x3FFu, 1023u);
+				a = toByteUInt((packed >> 30) & 0x003u, 3u);
+				break;
+			}
+			case format::r10g10b10a2_uint:
+			{
+				const uint32_t packed = reinterpret_cast<const uint32_t *>(row)[x];
+				r = toByteUInt((packed >> 0) & 0x3FFu, 1023u);
+				g = toByteUInt((packed >> 10) & 0x3FFu, 1023u);
+				b = toByteUInt((packed >> 20) & 0x3FFu, 1023u);
+				a = toByteUInt((packed >> 30) & 0x003u, 3u);
+				break;
+			}
+			case format::b10g10r10a2_unorm:
+			{
+				const uint32_t packed = reinterpret_cast<const uint32_t *>(row)[x];
+				b = toByteUInt((packed >> 0) & 0x3FFu, 1023u);
+				g = toByteUInt((packed >> 10) & 0x3FFu, 1023u);
+				r = toByteUInt((packed >> 20) & 0x3FFu, 1023u);
+				a = toByteUInt((packed >> 30) & 0x003u, 3u);
+				break;
+			}
+			case format::b10g10r10a2_uint:
+			{
+				const uint32_t packed = reinterpret_cast<const uint32_t *>(row)[x];
+				b = toByteUInt((packed >> 0) & 0x3FFu, 1023u);
+				g = toByteUInt((packed >> 10) & 0x3FFu, 1023u);
+				r = toByteUInt((packed >> 20) & 0x3FFu, 1023u);
+				a = toByteUInt((packed >> 30) & 0x003u, 3u);
+				break;
+			}
+			case format::r16g16b16a16_unorm:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 8);
+				r = toByteUInt(p[0], 65535u);
+				g = toByteUInt(p[1], 65535u);
+				b = toByteUInt(p[2], 65535u);
+				a = toByteUInt(p[3], 65535u);
+				break;
+			}
+			case format::r16g16b16a16_snorm:
+			{
+				const int16_t *p = reinterpret_cast<const int16_t *>(row + x * 8);
+				r = toByteSnorm(static_cast<float>(p[0]) / 32767.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 32767.0f);
+				b = toByteSnorm(static_cast<float>(p[2]) / 32767.0f);
+				a = toByteSnorm(static_cast<float>(p[3]) / 32767.0f);
+				break;
+			}
+			case format::r16g16b16a16_uint:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 8);
+				r = toByteUInt(p[0], 65535u);
+				g = toByteUInt(p[1], 65535u);
+				b = toByteUInt(p[2], 65535u);
+				a = toByteUInt(p[3], 65535u);
+				break;
+			}
+			case format::r16g16b16a16_sint:
+			{
+				const int16_t *p = reinterpret_cast<const int16_t *>(row + x * 8);
+				r = toByteSnorm(static_cast<float>(p[0]) / 32767.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 32767.0f);
+				b = toByteSnorm(static_cast<float>(p[2]) / 32767.0f);
+				a = toByteSnorm(static_cast<float>(p[3]) / 32767.0f);
+				break;
+			}
+			case format::r16g16b16a16_float:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 8);
+				r = toByteUnorm(halfToFloat(p[0]));
+				g = toByteUnorm(halfToFloat(p[1]));
+				b = toByteUnorm(halfToFloat(p[2]));
+				a = toByteUnorm(halfToFloat(p[3]));
+				break;
+			}
+			case format::r32g32b32a32_float:
+			{
+				const float *p = reinterpret_cast<const float *>(row + x * 16);
+				r = toByteUnorm(p[0]);
+				g = toByteUnorm(p[1]);
+				b = toByteUnorm(p[2]);
+				a = toByteUnorm(p[3]);
+				break;
+			}
+			case format::r32g32b32a32_uint:
+			{
+				const uint32_t *p = reinterpret_cast<const uint32_t *>(row + x * 16);
+				r = toByteUInt(p[0], 0xFFFFFFFFu);
+				g = toByteUInt(p[1], 0xFFFFFFFFu);
+				b = toByteUInt(p[2], 0xFFFFFFFFu);
+				a = toByteUInt(p[3], 0xFFFFFFFFu);
+				break;
+			}
+			case format::r32g32b32a32_sint:
+			{
+				const int32_t *p = reinterpret_cast<const int32_t *>(row + x * 16);
+				r = toByteSnorm(static_cast<float>(p[0]) / 2147483647.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 2147483647.0f);
+				b = toByteSnorm(static_cast<float>(p[2]) / 2147483647.0f);
+				a = toByteSnorm(static_cast<float>(p[3]) / 2147483647.0f);
+				break;
+			}
+			case format::r32g32_float:
+			{
+				const float *p = reinterpret_cast<const float *>(row + x * 8);
+				r = toByteUnorm(p[0]);
+				g = toByteUnorm(p[1]);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r32g32_uint:
+			{
+				const uint32_t *p = reinterpret_cast<const uint32_t *>(row + x * 8);
+				r = toByteUInt(p[0], 0xFFFFFFFFu);
+				g = toByteUInt(p[1], 0xFFFFFFFFu);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r32g32_sint:
+			{
+				const int32_t *p = reinterpret_cast<const int32_t *>(row + x * 8);
+				r = toByteSnorm(static_cast<float>(p[0]) / 2147483647.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 2147483647.0f);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r16g16_unorm:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 4);
+				r = toByteUInt(p[0], 65535u);
+				g = toByteUInt(p[1], 65535u);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r16g16_snorm:
+			{
+				const int16_t *p = reinterpret_cast<const int16_t *>(row + x * 4);
+				r = toByteSnorm(static_cast<float>(p[0]) / 32767.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 32767.0f);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r16g16_uint:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 4);
+				r = toByteUInt(p[0], 65535u);
+				g = toByteUInt(p[1], 65535u);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r16g16_sint:
+			{
+				const int16_t *p = reinterpret_cast<const int16_t *>(row + x * 4);
+				r = toByteSnorm(static_cast<float>(p[0]) / 32767.0f);
+				g = toByteSnorm(static_cast<float>(p[1]) / 32767.0f);
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r16g16_float:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 4);
+				r = toByteUnorm(halfToFloat(p[0]));
+				g = toByteUnorm(halfToFloat(p[1]));
+				b = 0;
+				a = 255;
+				break;
+			}
+			case format::r8g8_unorm:
+				r = row[x * 2 + 0];
+				g = row[x * 2 + 1];
+				b = 0;
+				a = 255;
+				break;
+			case format::r8g8_snorm:
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 2 + 0])) / 127.0f);
+				g = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 2 + 1])) / 127.0f);
+				b = 0;
+				a = 255;
+				break;
+			case format::r8g8_uint:
+				r = row[x * 2 + 0];
+				g = row[x * 2 + 1];
+				b = 0;
+				a = 255;
+				break;
+			case format::r8g8_sint:
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 2 + 0])) / 127.0f);
+				g = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x * 2 + 1])) / 127.0f);
+				b = 0;
+				a = 255;
+				break;
+			case format::r16_unorm:
+				r = toByteUInt(reinterpret_cast<const uint16_t *>(row)[x], 65535u);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r16_snorm:
+			{
+				const int16_t v = reinterpret_cast<const int16_t *>(row)[x];
+				r = toByteSnorm(static_cast<float>(v) / 32767.0f);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			}
+			case format::r16_uint:
+				r = toByteUInt(reinterpret_cast<const uint16_t *>(row)[x], 65535u);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r16_sint:
+			{
+				const int16_t v = reinterpret_cast<const int16_t *>(row)[x];
+				r = toByteSnorm(static_cast<float>(v) / 32767.0f);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			}
+			case format::r16_float:
+				r = toByteUnorm(halfToFloat(reinterpret_cast<const uint16_t *>(row)[x]));
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r32_float:
+				r = toByteUnorm(reinterpret_cast<const float *>(row)[x]);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r32_uint:
+				r = toByteUInt(reinterpret_cast<const uint32_t *>(row)[x], 0xFFFFFFFFu);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r32_sint:
+				r = toByteSnorm(static_cast<float>(reinterpret_cast<const int32_t *>(row)[x]) / 2147483647.0f);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::b5g6r5_unorm:
+			{
+				const uint16_t p = reinterpret_cast<const uint16_t *>(row)[x];
+				r = toByteUInt((p >> 11) & 0x1Fu, 31u);
+				g = toByteUInt((p >> 5) & 0x3Fu, 63u);
+				b = toByteUInt(p & 0x1Fu, 31u);
+				a = 255;
+				break;
+			}
+			case format::b5g5r5a1_unorm:
+			{
+				const uint16_t p = reinterpret_cast<const uint16_t *>(row)[x];
+				r = toByteUInt((p >> 10) & 0x1Fu, 31u);
+				g = toByteUInt((p >> 5) & 0x1Fu, 31u);
+				b = toByteUInt(p & 0x1Fu, 31u);
+				a = (p & 0x8000u) ? 255 : 0;
+				break;
+			}
+			case format::b5g5r5x1_unorm:
+			{
+				const uint16_t p = reinterpret_cast<const uint16_t *>(row)[x];
+				r = toByteUInt((p >> 10) & 0x1Fu, 31u);
+				g = toByteUInt((p >> 5) & 0x1Fu, 31u);
+				b = toByteUInt(p & 0x1Fu, 31u);
+				a = 255;
+				break;
+			}
+			case format::b4g4r4a4_unorm:
+			{
+				const uint16_t p = reinterpret_cast<const uint16_t *>(row)[x];
+				r = static_cast<uint8_t>(((p >> 8) & 0xFu) * 17u);
+				g = static_cast<uint8_t>(((p >> 4) & 0xFu) * 17u);
+				b = static_cast<uint8_t>((p & 0xFu) * 17u);
+				a = static_cast<uint8_t>(((p >> 12) & 0xFu) * 17u);
+				break;
+			}
+			case format::r8_unorm:
+			case format::l8_unorm:
+				r = row[x];
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r8_snorm:
+			{
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x])) / 127.0f);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			}
+			case format::r8_uint:
+				r = row[x];
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::r8_sint:
+			{
+				r = toByteSnorm(static_cast<float>(static_cast<int8_t>(row[x])) / 127.0f);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			}
+			case format::a8_unorm:
+				r = 255;
+				g = 255;
+				b = 255;
+				a = row[x];
+				break;
+			case format::l8a8_unorm:
+				r = row[x * 2 + 0];
+				g = r;
+				b = r;
+				a = row[x * 2 + 1];
+				break;
+			case format::l16_unorm:
+				r = toByteUInt(reinterpret_cast<const uint16_t *>(row)[x], 65535u);
+				g = r;
+				b = r;
+				a = 255;
+				break;
+			case format::l16a16_unorm:
+			{
+				const uint16_t *p = reinterpret_cast<const uint16_t *>(row + x * 4);
+				r = toByteUInt(p[0], 65535u);
+				g = r;
+				b = r;
+				a = toByteUInt(p[1], 65535u);
+				break;
+			}
+			default:
+				return false;
+			}
+
+			dst[x * 4 + 0] = r;
+			dst[x * 4 + 1] = g;
+			dst[x * 4 + 2] = b;
+			dst[x * 4 + 3] = a;
+		}
+	}
+
+	return true;
+}
+
+// Write width x height RGBA8 pixels as an uncompressed PNG.
 // Uses the zlib "stored" (no-compression) mode to avoid needing any library.
 static bool writePng(const std::string& path, uint32_t w, uint32_t h, const uint8_t* rgba)
 {
@@ -383,16 +1102,7 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 		if (desc.type != resource_type::texture_2d) continue;
 		if (desc.texture.samples > 1) { results.push_back("Skipped MSAA texture."); continue; }
 
-		const auto fmt     = desc.texture.format;
-		const bool isBGRA8 = (fmt == format::b8g8r8a8_unorm     || fmt == format::b8g8r8a8_unorm_srgb
-		                   || fmt == format::b8g8r8a8_typeless);
-		const bool isRGBA8 = (fmt == format::r8g8b8a8_unorm     || fmt == format::r8g8b8a8_unorm_srgb
-		                   || fmt == format::r8g8b8a8_typeless);
-		if (!isBGRA8 && !isRGBA8)
-		{
-			results.push_back("Skipped: unsupported format " + std::to_string((int)fmt) + ".");
-			continue;
-		}
+		const auto fmt = desc.texture.format;
 
 		const uint32_t w = desc.texture.width;
 		const uint32_t h = desc.texture.height;
@@ -406,7 +1116,7 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			continue;
 		}
 
-		// Copy GPU texture → staging, flush, wait
+		// Copy GPU texture to staging, flush, wait
 		cmd->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
 		cmd->copy_resource(res, staging);
 		cmd->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
@@ -417,26 +1127,23 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 		subresource_data data = {};
 		if (dev->map_texture_region(staging, 0, nullptr, map_access::read_only, &data) && data.data)
 		{
-			std::vector<uint8_t> pixels((size_t)w * h * 4);
-			const auto* src = static_cast<const uint8_t*>(data.data);
-			for (uint32_t y = 0; y < h; ++y)
-			{
-				const uint8_t* row = src + (size_t)y * data.row_pitch;
-				uint8_t*       dst = pixels.data() + (size_t)y * w * 4;
-				if (isBGRA8)
-					for (uint32_t x = 0; x < w; ++x)
-					{ dst[x*4]=row[x*4+2]; dst[x*4+1]=row[x*4+1]; dst[x*4+2]=row[x*4+0]; dst[x*4+3]=row[x*4+3]; }
-				else
-					memcpy(dst, row, (size_t)w * 4);
-			}
+			std::vector<uint8_t> pixels;
+			const bool converted = convertMappedTextureToRgba8(fmt, data, w, h, pixels);
 			dev->unmap_texture_region(staging, 0);
 
-			const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + std::to_string(n) + ".png";
-			if (writePng((exportDir / fname).string(), w, h, pixels.data()))
-				results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
+			if (!converted)
+			{
+				results.push_back("Skipped: unsupported format " + std::to_string((int)fmt) + ".");
+			}
 			else
-				results.push_back(fname + ": write failed.");
-			++n;
+			{
+				const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + std::to_string(n) + ".png";
+				if (writePng((exportDir / fname).string(), w, h, pixels.data()))
+					results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
+				else
+					results.push_back(fname + ": write failed.");
+				++n;
+			}
 		}
 		else
 		{
@@ -694,7 +1401,7 @@ static bool onDrawOrDispatchIndirect(command_list* commandList, indirect_command
 	return false;
 }
 
-// Helper — call once per frame per key
+// Helper - call once per frame per key
 // keyIndex: 0-8 maps to VK_NUMPAD1 through VK_NUMPAD9
 // action: the lambda to run when triggered
 template<typename F>
@@ -709,14 +1416,14 @@ static void handleHuntKey(effect_runtime* runtime, int vkKey, int keyIndex, F ac
 		return;
 	}
 	if (!state.isHeld) {
-		// Fresh press — fire immediately
+		// Fresh press - fire immediately
 		state.isHeld = true;
 		state.holdStart = now;
 		state.lastRepeat = now;
 		action();
 		return;
 	}
-	// Already held — check if past initial delay and repeat interval
+	// Already held - check if past initial delay and repeat interval
 	if ((now - state.holdStart) >= std::chrono::milliseconds(g_keyRepeatDelayMs) &&
 		(now - state.lastRepeat) >= std::chrono::milliseconds(g_keyRepeatIntervalMs))
 	{
