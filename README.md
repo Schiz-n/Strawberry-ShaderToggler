@@ -5,7 +5,7 @@ Custom reimplementation of ShaderToggler adapted for Where Winds Meet initially 
 All uses of this tool are purely cosmetic. It has no use in combat or lifeskilling.
 
 
-Original project copyright © FransBouma.
+Original project copyright © FransBouma / Strawberry / Schiz-N.
 Original repo: https://github.com/FransBouma/ShaderToggler
 
 

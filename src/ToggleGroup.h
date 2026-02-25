@@ -3,7 +3,7 @@
 // Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
 // to define groups of shaders to toggle them on/off with one key press
 // 
-// (c) Frans 'Otis_Inf' Bouma.
+// (c) Frans 'Otis_Inf' Bouma / Strawberry / Schiz-N.
 //
 // All rights reserved.
 // https://github.com/FransBouma/ShaderToggler

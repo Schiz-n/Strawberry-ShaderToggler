@@ -1,6 +1,6 @@
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Part of Injectable Generic Camera System
-// Copyright(c) 2017, Frans Bouma
+// Copyright(c) 2017, Frans Bouma / Strawberry / Schiz-N
 // All rights reserved.
 // https://github.com/FransBouma/InjectableGenericCameraSystem
 //

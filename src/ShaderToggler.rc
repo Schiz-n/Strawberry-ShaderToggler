@@ -77,11 +77,11 @@ BEGIN
     BEGIN
         BLOCK "040004b0"
         BEGIN
-            VALUE "CompanyName", "Frans 'Otis_Inf' Bouma"
+            VALUE "CompanyName", "Frans 'Otis_Inf' Bouma / Strawberry / Schiz-N"
             VALUE "FileDescription", "ShaderToggler Addon for ReShade 5+"
             VALUE "FileVersion", "1.2.1.0"
             VALUE "InternalName", "ShaderTo.dll"
-            VALUE "LegalCopyright", "Copyright (C) 2023 Frans Bouma"
+            VALUE "LegalCopyright", "Copyright (C) 2023 Frans Bouma / Strawberry / Schiz-N"
             VALUE "OriginalFilename", "ShaderTo.dll"
             VALUE "ProductName", "Shader Toggler addon for ReShade 5+"
             VALUE "ProductVersion", "1.2.1.0"
