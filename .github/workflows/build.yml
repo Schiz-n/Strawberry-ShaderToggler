@@ -25,11 +25,20 @@ jobs:
         $date = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         echo "value=$date" >> $env:GITHUB_OUTPUT
 
-    - name: Build project
+    - name: Build x64
       run: |
         msbuild src/ShaderToggler.sln `
           /p:Configuration=Release `
           /p:Platform=x64 `
+          /p:OutDir=..\artifacts\x64\ `
+          /m
+
+    - name: Build x86
+      run: |
+        msbuild src/ShaderToggler.sln `
+          /p:Configuration=Release `
+          /p:Platform=x86 `
+          /p:OutDir=..\artifacts\x86\ `
           /m
 
     - name: Create GitHub Release
@@ -37,6 +46,8 @@ jobs:
       with:
         tag_name: ${{ steps.timestamp.outputs.value }}
         name: Build ${{ steps.timestamp.outputs.value }}
-        files: src/x64/Release/ShaderToggler.addon64
+        files: |
+          artifacts/x64/ShaderToggler.addon64
+          artifacts/x86/ShaderToggler.addon
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
