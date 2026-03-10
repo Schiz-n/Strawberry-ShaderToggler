@@ -1199,7 +1199,7 @@ static void captureHuntedShaderSRVs(command_list* commandList)
 	const uint32_t                  current = g_pixelShaderManager.getShaderHash(data.activePixelShaderPipeline);
 	if (current != huntedHash) return;
 
-	g_lastHuntedPixelSRVs.clear();
+	// Accumulate across all draw calls this frame; deduplication happens at export time
 	for (uint32_t i = 0; i < MAX_PS_SRV_SLOTS; ++i)
 		if (data.pixelSRVs[i].handle)
 			g_lastHuntedPixelSRVs.push_back(data.pixelSRVs[i]);
@@ -1498,6 +1498,9 @@ static void onReshadePresent(effect_runtime* runtime)
 		g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
 		g_showExportResult  = true;
 	}
+
+	// Clear after export check so next frame starts fresh
+	g_lastHuntedPixelSRVs.clear();
 }
 
 
