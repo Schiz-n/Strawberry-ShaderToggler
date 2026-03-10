@@ -1111,8 +1111,8 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 		const uint32_t mipLayer  = srvDesc.texture.first_layer;
 		const uint32_t srcSubres = mipLayer * desc.texture.levels + mipLevel;
 
-		const uint32_t w = std::max(1u, desc.texture.width  >> mipLevel);
-		const uint32_t h = std::max(1u, desc.texture.height >> mipLevel);
+		const uint32_t w = (std::max)(1u, desc.texture.width  >> mipLevel);
+		const uint32_t h = (std::max)(1u, desc.texture.height >> mipLevel);
 
 		// Create a CPU-readable staging texture sized to this mip
 		resource staging = {0};
