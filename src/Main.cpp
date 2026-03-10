@@ -1104,10 +1104,17 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 
 		const auto fmt = desc.texture.format;
 
-		const uint32_t w = desc.texture.width;
-		const uint32_t h = desc.texture.height;
+		// Use the SRV's actual mip level so we export what the shader sees,
+		// and so our 1-mip staging matches the one subresource we copy.
+		const resource_view_desc srvDesc = dev->get_resource_view_desc(srv);
+		const uint32_t mipLevel  = srvDesc.texture.first_level;
+		const uint32_t mipLayer  = srvDesc.texture.first_layer;
+		const uint32_t srcSubres = mipLayer * desc.texture.levels + mipLevel;
 
-		// Create a CPU-readable staging texture
+		const uint32_t w = std::max(1u, desc.texture.width  >> mipLevel);
+		const uint32_t h = std::max(1u, desc.texture.height >> mipLevel);
+
+		// Create a CPU-readable staging texture sized to this mip
 		resource staging = {0};
 		const resource_desc stagingDesc(w, h, 1, 1, fmt, 1, memory_heap::gpu_to_cpu, resource_usage::copy_dest);
 		if (!dev->create_resource(stagingDesc, nullptr, resource_usage::copy_dest, &staging))
@@ -1116,9 +1123,9 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			continue;
 		}
 
-		// Copy GPU texture to staging, flush, wait
+		// Copy only the relevant subresource (avoids mip-count mismatch errors)
 		cmd->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
-		cmd->copy_resource(res, staging);
+		cmd->copy_texture_region(res, srcSubres, nullptr, staging, 0, nullptr);
 		cmd->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
 		queue->flush_immediate_command_list();
 		queue->wait_idle();
@@ -1139,7 +1146,11 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			{
 				const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + std::to_string(n) + ".png";
 				if (writePng((exportDir / fname).string(), w, h, pixels.data()))
-					results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
+				{
+					std::string msg = fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")";
+					if (mipLevel > 0) msg += "  mip" + std::to_string(mipLevel);
+					results.push_back(msg + "  exported.");
+				}
 				else
 					results.push_back(fname + ": write failed.");
 				++n;
