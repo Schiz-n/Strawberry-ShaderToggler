@@ -481,11 +481,24 @@ static uint32_t computeRawTexHash(const subresource_data& data, uint32_t w, uint
 // Implemented in WicLoader.cpp (isolated to avoid <wincodec.h> / reshade::api name conflicts).
 bool loadPngRgba(const std::filesystem::path& path, std::vector<uint8_t>& pixels, uint32_t& w, uint32_t& h);
 
-// Create an r8g8b8a8_unorm GPU texture + SRV from RGBA8 pixel data.
-static bool createOverrideSrv(device* dev, const std::vector<uint8_t>& pixels, uint32_t w, uint32_t h,
-                               resource& outTex, resource_view& outSrv)
+// Returns true if the format is an sRGB variant.
+static bool isSrgbFmt(reshade::api::format fmt)
 {
-	const resource_desc desc(w, h, 1, 1, format::r8g8b8a8_unorm, 1,
+	// Check the format directly - do NOT call format_to_default_typed with srgb_variant=0
+	// as that strips the sRGB flag before we can test it.
+	using F = reshade::api::format;
+	return fmt == F::r8g8b8a8_unorm_srgb  || fmt == F::b8g8r8a8_unorm_srgb  ||
+	       fmt == F::b8g8r8x8_unorm_srgb  || fmt == F::r8g8b8x8_unorm_srgb  ||
+	       fmt == F::bc1_unorm_srgb       || fmt == F::bc2_unorm_srgb        ||
+	       fmt == F::bc3_unorm_srgb       || fmt == F::bc7_unorm_srgb;
+}
+
+// Create a GPU texture + SRV from RGBA8 pixel data, preserving the original sRGB flag.
+static bool createOverrideSrv(device* dev, const std::vector<uint8_t>& pixels, uint32_t w, uint32_t h,
+                               bool srgb, resource& outTex, resource_view& outSrv)
+{
+	const reshade::api::format texFmt = srgb ? reshade::api::format::r8g8b8a8_unorm_srgb : reshade::api::format::r8g8b8a8_unorm;
+	const resource_desc desc(w, h, 1, 1, texFmt, 1,
 	                         memory_heap::gpu_only,
 	                         resource_usage::shader_resource | resource_usage::copy_dest);
 	if (!dev->create_resource(desc, nullptr, resource_usage::copy_dest, &outTex))
@@ -497,7 +510,7 @@ static bool createOverrideSrv(device* dev, const std::vector<uint8_t>& pixels, u
 	sd.slice_pitch = static_cast<uint32_t>(static_cast<size_t>(w) * h * 4);
 	dev->update_texture_region(sd, outTex, 0, nullptr);
 
-	const resource_view_desc srvDesc(format::r8g8b8a8_unorm, 0, 1, 0, 1);
+	const resource_view_desc srvDesc(texFmt, 0, 1, 0, 1);
 	if (!dev->create_resource_view(outTex, resource_usage::shader_resource, srvDesc, &outSrv))
 	{
 		dev->destroy_resource(outTex);
@@ -1156,7 +1169,8 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 	command_list*  cmd   = queue->get_immediate_command_list();
 	if (!cmd) { results.push_back("Error: no immediate command list."); return results; }
 
-	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path();
+	const std::filesystem::path exportDir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
+	std::filesystem::create_directories(exportDir);
 	std::unordered_set<uint64_t> seen;
 	int n = 0;
 
@@ -1633,7 +1647,7 @@ static void onReshadePresent(effect_runtime* runtime)
 		{
 			// Ctrl+Numpad 0: scan for override PNGs and inject them
 			device* dev = runtime->get_command_queue()->get_device();
-			const std::filesystem::path dir = std::filesystem::path(g_iniFileName).parent_path();
+			const std::filesystem::path dir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
 			std::vector<std::string> results;
 			int applied = 0;
 
@@ -1671,13 +1685,15 @@ static void onReshadePresent(effect_runtime* runtime)
 					continue;
 				}
 
+				const bool srgb = isSrgbFmt(dev->get_resource_desc(resource{resHandle}).texture.format);
+
 				std::lock_guard<std::mutex> lock(g_overrideMutex);
 				auto& ov = g_textureOverrides[resHandle];
 				if (ov.srv.handle) dev->destroy_resource_view(ov.srv);
 				if (ov.tex.handle) dev->destroy_resource(ov.tex);
 				ov = {};
 
-				if (!createOverrideSrv(dev, pixels, pw, ph, ov.tex, ov.srv))
+				if (!createOverrideSrv(dev, pixels, pw, ph, srgb, ov.tex, ov.srv))
 				{
 					results.push_back(stem + ": GPU upload failed.");
 					g_textureOverrides.erase(resHandle);
