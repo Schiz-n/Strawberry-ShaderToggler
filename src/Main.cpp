@@ -43,6 +43,8 @@
 #include <filesystem>
 #include <chrono>
 #include <unordered_set>
+#include <unordered_map>
+#include <mutex>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -93,6 +95,14 @@ static KeyRepeatState g_keyRepeat[9]; // one per numpad 1-9
 static std::vector<resource_view> g_lastHuntedPixelSRVs;
 static std::vector<std::string>   g_exportResultLines;
 static bool                       g_showExportResult = false;
+
+// Texture-override state
+struct OverrideEntry { resource tex = {0}; resource_view srv = {0}; };
+static std::mutex                                  g_overrideMutex;
+static std::unordered_map<std::string, uint64_t>   g_texHashToResource;  // content-hash hex -> resource handle
+static std::unordered_map<uint64_t, OverrideEntry> g_textureOverrides;   // resource handle -> GPU override
+static device*                                     g_device = nullptr;
+static thread_local bool                           t_inOverridePush = false;
 
 /// <summary>
 /// Calculates a crc32 hash from the passed in shader bytecode. The hash is used to identity the shader in future runs.
@@ -435,6 +445,66 @@ static void decodeBc4BlockSnorm(const uint8_t *block, uint8_t out[16])
 
 	for (int i = 0; i < 16; ++i)
 		out[i] = toByteSnorm(static_cast<float>(palette[(idx >> (3 * i)) & 0x7]) / 127.0f);
+}
+
+// Hash mip0 raw texture data, stripping row-pitch padding so the hash is
+// layout-independent and matches between mapped-staging and init_resource initial_data.
+static uint32_t computeRawTexHash(const subresource_data& data, uint32_t w, uint32_t h, reshade::api::format fmt)
+{
+	const reshade::api::format f = format_to_default_typed(fmt, 0);
+	using F = reshade::api::format;
+	const bool isBC8  = (f==F::bc1_unorm||f==F::bc1_unorm_srgb||
+	                     f==F::bc4_unorm||f==F::bc4_snorm);
+	const bool isBC16 = (f==F::bc2_unorm||f==F::bc2_unorm_srgb||
+	                     f==F::bc3_unorm||f==F::bc3_unorm_srgb||
+	                     f==F::bc5_unorm||f==F::bc5_snorm||
+	                     f==F::bc6h_ufloat||f==F::bc6h_sfloat||
+	                     f==F::bc7_unorm||f==F::bc7_unorm_srgb);
+
+	uint32_t bytesPerRow, nRows;
+	if      (isBC8)  { bytesPerRow = ((w+3)/4)*8;  nRows = (h+3)/4; }
+	else if (isBC16) { bytesPerRow = ((w+3)/4)*16; nRows = (h+3)/4; }
+	else             { bytesPerRow = data.row_pitch; nRows = h; }
+
+	const uint8_t* src = static_cast<const uint8_t*>(data.data);
+	if (bytesPerRow == data.row_pitch)
+		return compute_crc32(src, static_cast<size_t>(nRows) * bytesPerRow);
+
+	// Strip padding by collecting meaningful bytes
+	std::vector<uint8_t> buf;
+	buf.reserve(static_cast<size_t>(nRows) * bytesPerRow);
+	for (uint32_t r = 0; r < nRows; ++r)
+		buf.insert(buf.end(), src + r*data.row_pitch, src + r*data.row_pitch + bytesPerRow);
+	return compute_crc32(buf.data(), buf.size());
+}
+
+// Implemented in WicLoader.cpp (isolated to avoid <wincodec.h> / reshade::api name conflicts).
+bool loadPngRgba(const std::filesystem::path& path, std::vector<uint8_t>& pixels, uint32_t& w, uint32_t& h);
+
+// Create an r8g8b8a8_unorm GPU texture + SRV from RGBA8 pixel data.
+static bool createOverrideSrv(device* dev, const std::vector<uint8_t>& pixels, uint32_t w, uint32_t h,
+                               resource& outTex, resource_view& outSrv)
+{
+	const resource_desc desc(w, h, 1, 1, format::r8g8b8a8_unorm, 1,
+	                         memory_heap::gpu_only,
+	                         resource_usage::shader_resource | resource_usage::copy_dest);
+	if (!dev->create_resource(desc, nullptr, resource_usage::copy_dest, &outTex))
+		return false;
+
+	subresource_data sd{};
+	sd.data        = const_cast<uint8_t*>(pixels.data());
+	sd.row_pitch   = w * 4;
+	sd.slice_pitch = static_cast<uint32_t>(static_cast<size_t>(w) * h * 4);
+	dev->update_texture_region(sd, outTex, 0, nullptr);
+
+	const resource_view_desc srvDesc(format::r8g8b8a8_unorm, 0, 1, 0, 1);
+	if (!dev->create_resource_view(outTex, resource_usage::shader_resource, srvDesc, &outSrv))
+	{
+		dev->destroy_resource(outTex);
+		outTex = {0};
+		return false;
+	}
+	return true;
 }
 
 static bool convertMappedTextureToRgba8(reshade::api::format fmtIn, const subresource_data &data, uint32_t w, uint32_t h, std::vector<uint8_t> &pixels)
@@ -1102,19 +1172,11 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 		if (desc.type != resource_type::texture_2d) continue;
 		if (desc.texture.samples > 1) { results.push_back("Skipped MSAA texture."); continue; }
 
-		const auto fmt = desc.texture.format;
+		const auto     fmt = desc.texture.format;
+		const uint32_t w   = desc.texture.width;
+		const uint32_t h   = desc.texture.height;
 
-		// Use the SRV's actual mip level so we export what the shader sees,
-		// and so our 1-mip staging matches the one subresource we copy.
-		const resource_view_desc srvDesc = dev->get_resource_view_desc(srv);
-		const uint32_t mipLevel  = srvDesc.texture.first_level;
-		const uint32_t mipLayer  = srvDesc.texture.first_layer;
-		const uint32_t srcSubres = mipLayer * desc.texture.levels + mipLevel;
-
-		const uint32_t w = (std::max)(1u, desc.texture.width  >> mipLevel);
-		const uint32_t h = (std::max)(1u, desc.texture.height >> mipLevel);
-
-		// Create a CPU-readable staging texture sized to this mip
+		// Always copy mip 0 - full resolution, and matches what onInitResource hashes.
 		resource staging = {0};
 		const resource_desc stagingDesc(w, h, 1, 1, fmt, 1, memory_heap::gpu_to_cpu, resource_usage::copy_dest);
 		if (!dev->create_resource(stagingDesc, nullptr, resource_usage::copy_dest, &staging))
@@ -1123,17 +1185,17 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			continue;
 		}
 
-		// Copy only the relevant subresource (avoids mip-count mismatch errors)
 		cmd->barrier(res, resource_usage::shader_resource, resource_usage::copy_source);
-		cmd->copy_texture_region(res, srcSubres, nullptr, staging, 0, nullptr);
+		cmd->copy_texture_region(res, 0, nullptr, staging, 0, nullptr);
 		cmd->barrier(res, resource_usage::copy_source, resource_usage::shader_resource);
 		queue->flush_immediate_command_list();
 		queue->wait_idle();
 
-		// Map staging and convert to RGBA8
+		// Map staging, hash raw bytes, then convert to RGBA8 for PNG
 		subresource_data data = {};
 		if (dev->map_texture_region(staging, 0, nullptr, map_access::read_only, &data) && data.data)
 		{
+			const uint32_t texHash = computeRawTexHash(data, w, h, fmt);
 			std::vector<uint8_t> pixels;
 			const bool converted = convertMappedTextureToRgba8(fmt, data, w, h, pixels);
 			dev->unmap_texture_region(staging, 0);
@@ -1144,13 +1206,9 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 			}
 			else
 			{
-				const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + std::to_string(n) + ".png";
+				const std::string fname = "ps_" + toHexStr(shaderHash) + "_" + toHexStr(texHash) + ".png";
 				if (writePng((exportDir / fname).string(), w, h, pixels.data()))
-				{
-					std::string msg = fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")";
-					if (mipLevel > 0) msg += "  mip" + std::to_string(mipLevel);
-					results.push_back(msg + "  exported.");
-				}
+					results.push_back(fname + "  (" + std::to_string(w) + "x" + std::to_string(h) + ")  exported.");
 				else
 					results.push_back(fname + ": write failed.");
 				++n;
@@ -1169,16 +1227,19 @@ static std::vector<std::string> exportTextures(effect_runtime* runtime, uint32_t
 	return results;
 }
 
-// Track resource views bound to the pixel-shader stage.
-static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeline_layout, uint32_t,
+// Track resource views bound to the pixel-shader stage, and swap in override SRVs if any exist.
+static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeline_layout layout, uint32_t paramIdx,
                                const descriptor_set_update& update)
 {
-	if ((stages & shader_stage::pixel) == shader_stage::pixel
-	    && update.type == descriptor_type::shader_resource_view
-	    && update.count > 0 && update.descriptors)
+	if ((stages & shader_stage::pixel) != shader_stage::pixel) return;
+	if (update.type != descriptor_type::shader_resource_view) return;
+	if (update.count == 0 || !update.descriptors) return;
+
+	const resource_view* views = static_cast<const resource_view*>(update.descriptors);
+
+	// Record SRVs for texture export
 	{
 		auto& data = cmdList->get_private_data<CommandListDataContainer>();
-		const resource_view* views = static_cast<const resource_view*>(update.descriptors);
 		for (uint32_t i = 0; i < update.count; ++i)
 		{
 			const uint32_t slot = update.binding + i;
@@ -1186,6 +1247,79 @@ static void onPushDescriptors(command_list* cmdList, shader_stage stages, pipeli
 				data.pixelSRVs[slot] = views[i];
 		}
 	}
+
+	// Re-push with overridden SRVs if any are active (guard against re-entrancy)
+	if (t_inOverridePush || !g_device) return;
+	{
+		std::lock_guard<std::mutex> lock(g_overrideMutex);
+		if (g_textureOverrides.empty()) return;
+
+		bool hasOverride = false;
+		for (uint32_t i = 0; i < update.count && !hasOverride; ++i)
+		{
+			if (!views[i].handle) continue;
+			const resource res = g_device->get_resource_from_view(views[i]);
+			if (res.handle && g_textureOverrides.count(res.handle))
+				hasOverride = true;
+		}
+		if (!hasOverride) return;
+
+		std::vector<resource_view> replaced(update.count);
+		for (uint32_t i = 0; i < update.count; ++i)
+		{
+			replaced[i] = views[i];
+			if (views[i].handle)
+			{
+				const resource res = g_device->get_resource_from_view(views[i]);
+				const auto it = g_textureOverrides.find(res.handle);
+				if (it != g_textureOverrides.end() && it->second.srv.handle)
+					replaced[i] = it->second.srv;
+			}
+		}
+
+		descriptor_set_update newUpdate  = update;
+		newUpdate.descriptors            = replaced.data();
+		t_inOverridePush = true;
+		cmdList->push_descriptors(stages, layout, paramIdx, newUpdate);
+		t_inOverridePush = false;
+	}
+}
+
+// Register all 2D textures that arrive with initial data so we can match them to override PNGs.
+static void onInitResource(device* dev, const resource_desc& desc,
+                            const subresource_data* initial_data, resource_usage,
+                            resource res)
+{
+	if (!g_device) g_device = dev;
+	if (desc.type != resource_type::texture_2d) return;
+	if (!initial_data || !initial_data[0].data) return;
+	if (desc.texture.samples > 1) return;
+	if (desc.texture.width < 4 || desc.texture.height < 4) return;
+
+	const uint32_t texHash = computeRawTexHash(initial_data[0],
+	                                            desc.texture.width, desc.texture.height,
+	                                            desc.texture.format);
+	const std::string hexHash = toHexStr(texHash);
+
+	std::lock_guard<std::mutex> lock(g_overrideMutex);
+	g_texHashToResource[hexHash] = res.handle;
+}
+
+// Clean up any override for a resource that's being destroyed.
+static void onDestroyResource(device* dev, resource res)
+{
+	std::lock_guard<std::mutex> lock(g_overrideMutex);
+
+	auto oit = g_textureOverrides.find(res.handle);
+	if (oit != g_textureOverrides.end())
+	{
+		if (oit->second.srv.handle) dev->destroy_resource_view(oit->second.srv);
+		if (oit->second.tex.handle) dev->destroy_resource(oit->second.tex);
+		g_textureOverrides.erase(oit);
+	}
+
+	for (auto it = g_texHashToResource.begin(); it != g_texHashToResource.end(); )
+		it = (it->second == res.handle) ? g_texHashToResource.erase(it) : std::next(it);
 }
 
 // If the draw call is using the currently hunted pixel shader, snapshot its SRVs.
@@ -1489,14 +1623,84 @@ static void onReshadePresent(effect_runtime* runtime)
 	handleHuntKey(runtime, VK_NUMPAD8, 7, [&]{ g_computeShaderManager.huntNextShader(ctrlDown); });
 	handleHuntKey(runtime, VK_NUMPAD9, 8, [&]{ g_computeShaderManager.toggleMarkOnHuntedShader(); });
 
-	// Numpad 0: export textures bound to the currently hunted pixel shader
+	// Numpad 0: export textures (plain); Ctrl+Numpad 0: reload & inject override PNGs
 	if (runtime->is_key_pressed(VK_NUMPAD0)
 	    && g_pixelShaderManager.isInHuntingMode()
 	    && g_activeCollectorFrameCounter == 0
 	    && g_pixelShaderManager.getActiveHuntedShaderHash() != 0)
 	{
-		g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
-		g_showExportResult  = true;
+		if (ctrlDown)
+		{
+			// Ctrl+Numpad 0: scan for override PNGs and inject them
+			device* dev = runtime->get_command_queue()->get_device();
+			const std::filesystem::path dir = std::filesystem::path(g_iniFileName).parent_path();
+			std::vector<std::string> results;
+			int applied = 0;
+
+			for (auto& entry : std::filesystem::directory_iterator(dir))
+			{
+				if (entry.path().extension() != ".png") continue;
+				const std::string stem = entry.path().stem().string();
+
+				// Pattern: ps_<8hex>_<8hex>
+				if (stem.size() < 20 || stem.compare(0, 3, "ps_") != 0) continue;
+				const size_t sep = stem.rfind('_');
+				if (sep < 3 || sep + 9 != stem.size()) continue;
+				const std::string texHashHex = stem.substr(sep + 1);
+				bool validHex = true;
+				for (char c : texHashHex) if (!isxdigit((unsigned char)c)) { validHex = false; break; }
+				if (!validHex) continue;
+
+				uint64_t resHandle = 0;
+				{
+					std::lock_guard<std::mutex> lock(g_overrideMutex);
+					const auto it = g_texHashToResource.find(texHashHex);
+					if (it == g_texHashToResource.end())
+					{
+						results.push_back(stem + ": no matching live texture.");
+						continue;
+					}
+					resHandle = it->second;
+				}
+
+				std::vector<uint8_t> pixels;
+				uint32_t pw = 0, ph = 0;
+				if (!loadPngRgba(entry.path(), pixels, pw, ph))
+				{
+					results.push_back(stem + ": PNG load failed.");
+					continue;
+				}
+
+				std::lock_guard<std::mutex> lock(g_overrideMutex);
+				auto& ov = g_textureOverrides[resHandle];
+				if (ov.srv.handle) dev->destroy_resource_view(ov.srv);
+				if (ov.tex.handle) dev->destroy_resource(ov.tex);
+				ov = {};
+
+				if (!createOverrideSrv(dev, pixels, pw, ph, ov.tex, ov.srv))
+				{
+					results.push_back(stem + ": GPU upload failed.");
+					g_textureOverrides.erase(resHandle);
+					continue;
+				}
+				results.push_back(stem + "  (" + std::to_string(pw) + "x" + std::to_string(ph) + ")  injected.");
+				++applied;
+			}
+
+			if (results.empty())
+				results.push_back("No override PNGs found in " + dir.string() + ".");
+			else if (applied > 0)
+				results.push_back(std::to_string(applied) + " override(s) active. Edit PNGs and press Ctrl+Numpad0 again to reload.");
+
+			g_exportResultLines = results;
+			g_showExportResult  = true;
+		}
+		else
+		{
+			// Plain Numpad 0: export
+			g_exportResultLines = exportTextures(runtime, g_pixelShaderManager.getActiveHuntedShaderHash());
+			g_showExportResult  = true;
+		}
 	}
 
 	// Clear after export check so next frame starts fresh
@@ -1617,7 +1821,8 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		ImGui::TextUnformatted("* Numpad 7 and Numpad 8: previous/next compute shader");
 		ImGui::TextUnformatted("* Ctrl + Numpad 7 and Ctrl + Numpad 8: previous/next marked compute shader in the group");
 		ImGui::TextUnformatted("* Numpad 9: mark/unmark the current compute shader as being part of the group");
-		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files");
+		ImGui::TextUnformatted("* Numpad 0: export textures bound to the current pixel shader as PNG files (filename includes content hash)");
+		ImGui::TextUnformatted("* Ctrl+Numpad 0: scan the addon folder for override PNGs and inject them (replace matching textures in-game)");
 		ImGui::TextUnformatted("\nWhen you step through the shaders, the current shader is disabled in the 3D scene so you can see if that's the shader you were looking for.");
 		ImGui::TextUnformatted("When you're done, make sure you click 'Save all toggle groups' to preserve the groups you defined so next time you start your game they're loaded in and you can use them right away.");
 		ImGui::PopTextWrapPos();
@@ -1844,6 +2049,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 			reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
 			reshade::register_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
+			reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
+			reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
 			reshade::register_overlay(nullptr, &displaySettings);
 			loadShaderTogglerIniFile();
 		}
@@ -1858,6 +2065,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 		reshade::unregister_event<reshade::addon_event::draw_indexed>(onDrawIndexed);
 		reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(onDrawOrDispatchIndirect);
 		reshade::unregister_event<reshade::addon_event::push_descriptors>(onPushDescriptors);
+		reshade::unregister_event<reshade::addon_event::init_resource>(onInitResource);
+		reshade::unregister_event<reshade::addon_event::destroy_resource>(onDestroyResource);
 		reshade::unregister_event<reshade::addon_event::init_command_list>(onInitCommandList);
 		reshade::unregister_event<reshade::addon_event::destroy_command_list>(onDestroyCommandList);
 		reshade::unregister_event<reshade::addon_event::reset_command_list>(onResetCommandList);
