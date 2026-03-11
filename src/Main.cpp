@@ -520,6 +520,77 @@ static bool createOverrideSrv(device* dev, const std::vector<uint8_t>& pixels, u
 	return true;
 }
 
+static std::vector<std::string> applyTextureOverrides(device* dev)
+{
+	const std::filesystem::path dir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
+	std::vector<std::string> results;
+	int applied = 0;
+
+	if (!std::filesystem::exists(dir))
+	{
+		results.push_back("Folder not found: " + dir.string());
+		return results;
+	}
+
+	for (auto& entry : std::filesystem::directory_iterator(dir))
+	{
+		if (entry.path().extension() != ".png") continue;
+		const std::string stem = entry.path().stem().string();
+
+		if (stem.size() < 20 || stem.compare(0, 3, "ps_") != 0) continue;
+		const size_t sep = stem.rfind('_');
+		if (sep < 3 || sep + 9 != stem.size()) continue;
+		const std::string texHashHex = stem.substr(sep + 1);
+		bool validHex = true;
+		for (char c : texHashHex) if (!isxdigit((unsigned char)c)) { validHex = false; break; }
+		if (!validHex) continue;
+
+		uint64_t resHandle = 0;
+		{
+			std::lock_guard<std::mutex> lock(g_overrideMutex);
+			const auto it = g_texHashToResource.find(texHashHex);
+			if (it == g_texHashToResource.end())
+			{
+				results.push_back(stem + ": no matching live texture.");
+				continue;
+			}
+			resHandle = it->second;
+		}
+
+		std::vector<uint8_t> pixels;
+		uint32_t pw = 0, ph = 0;
+		if (!loadPngRgba(entry.path(), pixels, pw, ph))
+		{
+			results.push_back(stem + ": PNG load failed.");
+			continue;
+		}
+
+		const bool srgb = isSrgbFmt(dev->get_resource_desc(resource{resHandle}).texture.format);
+
+		std::lock_guard<std::mutex> lock(g_overrideMutex);
+		auto& ov = g_textureOverrides[resHandle];
+		if (ov.srv.handle) dev->destroy_resource_view(ov.srv);
+		if (ov.tex.handle) dev->destroy_resource(ov.tex);
+		ov = {};
+
+		if (!createOverrideSrv(dev, pixels, pw, ph, srgb, ov.tex, ov.srv))
+		{
+			results.push_back(stem + ": GPU upload failed.");
+			g_textureOverrides.erase(resHandle);
+			continue;
+		}
+		results.push_back(stem + "  (" + std::to_string(pw) + "x" + std::to_string(ph) + ")  injected.");
+		++applied;
+	}
+
+	if (results.empty())
+		results.push_back("No override PNGs found in " + dir.string() + ".");
+	else if (applied > 0)
+		results.push_back(std::to_string(applied) + " override(s) active.");
+
+	return results;
+}
+
 static bool convertMappedTextureToRgba8(reshade::api::format fmtIn, const subresource_data &data, uint32_t w, uint32_t h, std::vector<uint8_t> &pixels)
 {
 	const reshade::api::format fmt = format_to_default_typed(fmtIn, 0);
@@ -1647,68 +1718,7 @@ static void onReshadePresent(effect_runtime* runtime)
 		{
 			// Ctrl+Numpad 0: scan for override PNGs and inject them
 			device* dev = runtime->get_command_queue()->get_device();
-			const std::filesystem::path dir = std::filesystem::path(g_iniFileName).parent_path() / "shortcake";
-			std::vector<std::string> results;
-			int applied = 0;
-
-			for (auto& entry : std::filesystem::directory_iterator(dir))
-			{
-				if (entry.path().extension() != ".png") continue;
-				const std::string stem = entry.path().stem().string();
-
-				// Pattern: ps_<8hex>_<8hex>
-				if (stem.size() < 20 || stem.compare(0, 3, "ps_") != 0) continue;
-				const size_t sep = stem.rfind('_');
-				if (sep < 3 || sep + 9 != stem.size()) continue;
-				const std::string texHashHex = stem.substr(sep + 1);
-				bool validHex = true;
-				for (char c : texHashHex) if (!isxdigit((unsigned char)c)) { validHex = false; break; }
-				if (!validHex) continue;
-
-				uint64_t resHandle = 0;
-				{
-					std::lock_guard<std::mutex> lock(g_overrideMutex);
-					const auto it = g_texHashToResource.find(texHashHex);
-					if (it == g_texHashToResource.end())
-					{
-						results.push_back(stem + ": no matching live texture.");
-						continue;
-					}
-					resHandle = it->second;
-				}
-
-				std::vector<uint8_t> pixels;
-				uint32_t pw = 0, ph = 0;
-				if (!loadPngRgba(entry.path(), pixels, pw, ph))
-				{
-					results.push_back(stem + ": PNG load failed.");
-					continue;
-				}
-
-				const bool srgb = isSrgbFmt(dev->get_resource_desc(resource{resHandle}).texture.format);
-
-				std::lock_guard<std::mutex> lock(g_overrideMutex);
-				auto& ov = g_textureOverrides[resHandle];
-				if (ov.srv.handle) dev->destroy_resource_view(ov.srv);
-				if (ov.tex.handle) dev->destroy_resource(ov.tex);
-				ov = {};
-
-				if (!createOverrideSrv(dev, pixels, pw, ph, srgb, ov.tex, ov.srv))
-				{
-					results.push_back(stem + ": GPU upload failed.");
-					g_textureOverrides.erase(resHandle);
-					continue;
-				}
-				results.push_back(stem + "  (" + std::to_string(pw) + "x" + std::to_string(ph) + ")  injected.");
-				++applied;
-			}
-
-			if (results.empty())
-				results.push_back("No override PNGs found in " + dir.string() + ".");
-			else if (applied > 0)
-				results.push_back(std::to_string(applied) + " override(s) active. Edit PNGs and press Ctrl+Numpad0 again to reload.");
-
-			g_exportResultLines = results;
+			g_exportResultLines = applyTextureOverrides(dev);
 			g_showExportResult  = true;
 		}
 		else
@@ -1872,6 +1882,13 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		if(ImGui::Button(" New "))
 		{
 			addDefaultGroup();
+		}
+		ImGui::SameLine();
+		if(ImGui::Button(" Apply Textures "))
+		{
+			device* dev = runtime->get_command_queue()->get_device();
+			g_exportResultLines = applyTextureOverrides(dev);
+			g_showExportResult  = true;
 		}
 		ImGui::Separator();
 
