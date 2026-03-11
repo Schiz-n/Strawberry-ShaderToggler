@@ -55,7 +55,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="ShaderToggler.rc">
+    <ResourceCompile Include="Shortcake.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>

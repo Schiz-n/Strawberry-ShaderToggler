@@ -1,11 +1,12 @@
 ///////////////////////////////////////////////////////////////////////
 //
-// Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
+// Part of Shortcake, a shader toggler add on for Reshade 5+ which allows you
 // to define groups of shaders to toggle them on/off with one key press
 // 
-// (c) Frans 'Otis_Inf' Bouma / Strawberry / Schiz-N.
+// (c)  Strawberry / Frans 'Otis_Inf' Bouma / Schiz-N.
 //
 // All rights reserved.
+// https://github.com/Schiz-n/Strawberry-Shortcake
 // https://github.com/FransBouma/ShaderToggler
 //
 // Redistribution and use in source and binary forms, with or without
@@ -34,7 +35,7 @@
 
 using namespace reshade::api;
 
-namespace ShaderToggler
+namespace Shortcake
 {
 	ShaderManager::ShaderManager(): _activeHuntedShaderHash(0)
 	{

@@ -1,11 +1,12 @@
 ///////////////////////////////////////////////////////////////////////
 //
-// Part of ShaderToggler, a shader toggler add on for Reshade 5+ which allows you
+// Part of Shortcake, a shader toggler add on for Reshade 5+ which allows you
 // to define groups of shaders to toggle them on/off with one key press
 // 
-// (c) Frans 'Otis_Inf' Bouma / Strawberry / Schiz-N.
+// (c)  Strawberry / Frans 'Otis_Inf' Bouma / Schiz-N.
 //
 // All rights reserved.
+// https://github.com/Schiz-n/Strawberry-Shortcake
 // https://github.com/FransBouma/ShaderToggler
 //
 // Redistribution and use in source and binary forms, with or without
@@ -51,9 +52,9 @@
 #include <cstdio>
 
 using namespace reshade::api;
-using namespace ShaderToggler;
+using namespace Shortcake;
 
-extern "C" __declspec(dllexport) const char *NAME = "Shader Toggler";
+extern "C" __declspec(dllexport) const char *NAME = "Strawberry Shortcake";
 extern "C" __declspec(dllexport) const char *DESCRIPTION = "Add-on which allows you to define groups of game shaders to toggle on/off with one key press.";
 
 static constexpr uint32_t MAX_PS_SRV_SLOTS = 128;
@@ -66,11 +67,11 @@ struct __declspec(uuid("038B03AA-4C75-443B-A695-752D80797037")) CommandListDataC
 };
 
 #define FRAMECOUNT_COLLECTION_PHASE_DEFAULT 250;
-#define HASH_FILE_NAME	"ShaderToggler.ini"
+#define HASH_FILE_NAME	"Shortcake.ini"
 
-static ShaderToggler::ShaderManager g_pixelShaderManager;
-static ShaderToggler::ShaderManager g_vertexShaderManager;
-static ShaderToggler::ShaderManager g_computeShaderManager;
+static Shortcake::ShaderManager g_pixelShaderManager;
+static Shortcake::ShaderManager g_vertexShaderManager;
+static Shortcake::ShaderManager g_computeShaderManager;
 static KeyData g_keyCollector;
 static atomic_uint32_t g_activeCollectorFrameCounter = 0;
 static std::vector<ToggleGroup> g_toggleGroups;
@@ -135,7 +136,7 @@ void addDefaultGroup()
 /// <summary>
 /// Loads the defined hashes and groups from the shaderToggler.ini file.
 /// </summary>
-void loadShaderTogglerIniFile()
+void loadShortcakeIniFile()
 {
 	// Will assume it's started at the start of the application and therefore no groups are present.
 	CDataFile iniFile;
@@ -178,7 +179,7 @@ void loadShaderTogglerIniFile()
 /// <summary>
 /// Saves the currently known toggle groups with their shader hashes to the shadertoggler.ini file
 /// </summary>
-void saveShaderTogglerIniFile()
+void saveShortcakeIniFile()
 {
 	// format: first section with # of groups, then per group a section with pixel and vertex shaders, as well as their name and key value.
 	// groups are stored with "Group" + group counter, starting with 0.
@@ -1451,7 +1452,7 @@ static void onReshadeOverlay(reshade::api::effect_runtime *runtime)
 	{
 		ImGui::SetNextWindowBgAlpha(g_overlayOpacity);
 		ImGui::SetNextWindowPos(ImVec2(10, 10));
-		if (!ImGui::Begin("ShaderTogglerInfo", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | 
+		if (!ImGui::Begin("ShortcakeInfo", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize | 
 														ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings))
 		{
 			ImGui::End();
@@ -2045,7 +2046,7 @@ static void displaySettings(reshade::api::effect_runtime* runtime)
 		{
 			if(ImGui::Button("Save all Toggle Groups"))
 			{
-				saveShaderTogglerIniFile();
+				saveShortcakeIniFile();
 			}
 		}
 	}
@@ -2085,7 +2086,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			reshade::register_event<reshade::addon_event::init_resource>(onInitResource);
 			reshade::register_event<reshade::addon_event::destroy_resource>(onDestroyResource);
 			reshade::register_overlay(nullptr, &displaySettings);
-			loadShaderTogglerIniFile();
+			loadShortcakeIniFile();
 		}
 		break;
 	case DLL_PROCESS_DETACH:

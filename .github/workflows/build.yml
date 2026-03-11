@@ -1,4 +1,4 @@
-name: Build and Auto-Release ShaderToggler
+name: Build and Auto-Release Shortcake
 
 on:
   push:
@@ -27,7 +27,7 @@ jobs:
 
     - name: Build x64
       run: |
-        msbuild src/ShaderToggler.sln `
+        msbuild src/Shortcake.sln `
           /p:Configuration=Release `
           /p:Platform=x64 `
           /p:OutDir=..\artifacts\x64\ `
@@ -35,7 +35,7 @@ jobs:
 
     - name: Build x86
       run: |
-        msbuild src/ShaderToggler.sln `
+        msbuild src/Shortcake.sln `
           /p:Configuration=Release `
           /p:Platform=x86 `
           /p:OutDir=..\artifacts\x86\ `
@@ -47,7 +47,7 @@ jobs:
         tag_name: ${{ steps.timestamp.outputs.value }}
         name: Build ${{ steps.timestamp.outputs.value }}
         files: |
-          artifacts/x64/ShaderToggler.addon64
-          artifacts/x86/ShaderToggler.addon
+          artifacts/x64/Shortcake.addon64
+          artifacts/x86/Shortcake.addon
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
